@@ -18,6 +18,7 @@ import {
   Waves,
 } from 'lucide-react';
 import RiverChart from './components/RiverChart';
+import WeatherForecast from './components/WeatherForecast';
 import LevelGauge from './components/LevelGauge';
 import Brasao from './components/Brasao';
 import RainMap from './components/RainMap';
@@ -571,6 +572,9 @@ export default function App() {
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-red-400" /> Inundação {n2(COTAS.inundacao)} m</span>
             </div>
           </section>
+
+          {/* ---------- Previsão meteorológica ---------- */}
+          <WeatherForecast />
 
           {/* ---------- Fontes pluviométricas ---------- */}
           <section className={`overflow-hidden ${CARD}`}>

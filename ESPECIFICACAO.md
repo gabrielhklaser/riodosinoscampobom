@@ -9,9 +9,9 @@
 ## 1. Objetivo
 
 Dashboard em **React + Vite + Tailwind CSS** para monitoramento do nível do
-**Rio dos Sinos em Campo Bom/RS**, com dados oficiais da ANA, atualização
-automática, análise pluviométrica da bacia, mapas interativos, consulta de
-risco por endereço e modelagem de cenário de alagamento.
+**Rio dos Sinos em Campo Bom/RS**, com dados oficiais da ANA, previsão do tempo
+por ECMWF e GFS, atualização automática, análise pluviométrica da bacia, mapas
+interativos, consulta de risco por endereço e modelagem de cenário de alagamento.
 
 **Stack:** React 19 · Vite · Tailwind 4 · Recharts · Leaflet + react-leaflet ·
 lucide-react · fflate
@@ -74,6 +74,7 @@ Para elas, obter a chuva no **Open-Meteo nas coordenadas cadastradas**.
 | Uso | Serviço |
 |---|---|
 | Chuva horária | `api.open-meteo.com/v1/forecast` (`hourly=precipitation`) |
+| Previsão do tempo | `api.open-meteo.com/v1/forecast` com `models=ecmwf_ifs025` e `models=gfs_seamless` |
 | Chuva histórica | `archive-api.open-meteo.com/v1/archive` |
 | Geocodificação | Nominatim/OpenStreetMap + BrasilAPI (CEP) |
 | Elevação (principal) | `api.opentopodata.org/v1/srtm30m` com `interpolation=bilinear` |
@@ -86,11 +87,12 @@ Para elas, obter a chuva no **Open-Meteo nas coordenadas cadastradas**.
 1. Cabeçalho fixo
 2. Cards de KPI + régua da estação
 3. Gráfico da curva de elevação
-4. Tabela de estações pluviométricas
-5. Mapa da bacia + consulta de endereço
-6. Modelagem de cenário de alagamento
-7. Tabela de medições + ficha da estação
-8. Rodapé
+4. Previsão do tempo em Campo Bom (ECMWF IFS + GFS, 5 dias)
+5. Tabela de estações pluviométricas
+6. Mapa da bacia + consulta de endereço
+7. Modelagem de cenário de alagamento
+8. Tabela de medições + ficha da estação
+9. Rodapé
 
 ---
 
@@ -131,7 +133,19 @@ Para elas, obter a chuva no **Open-Meteo nas coordenadas cadastradas**.
 - *Downsampling* que preserva picos (não achatar a subida)
 - Tooltip com nível, vazão, chuva média e leitura instrumental de Campo Bom
 
-### 4.4 Tabela de estações pluviométricas
+### 4.4 Previsão meteorológica em Campo Bom
+
+- Seção pública posicionada imediatamente abaixo do gráfico da curva de elevação
+- Previsão diária de **5 dias** para Campo Bom/RS nas coordenadas `-29.6917, -51.0461`
+- Consultas independentes ao Open-Meteo para os modelos **ECMWF IFS** (`ecmwf_ifs025`)
+  e **GFS** (`gfs_seamless`), sem exigir chave de API
+- Exibe condição atual estimada, temperatura, sensação térmica, umidade, vento,
+  precipitação, probabilidade de chuva e acumulado diário em cartões separados
+- Um modelo indisponível não impede a exibição do outro; atualização manual e automática a cada 15 minutos
+- A seção identifica a fonte Open-Meteo e informa que as previsões são estimativas,
+  não substituindo avisos oficiais da Defesa Civil
+
+### 4.5 Tabela de estações pluviométricas
 
 Campo Bom + 5 a montante: **Sapiranga · Nova Hartz/Araricá · Parobé · Taquara · Rolante**
 
@@ -141,7 +155,7 @@ acumulado no período · última hora · **origem do dado**.
 Distinguir com selo: `Telemetria ANA (medido)` × `Open-Meteo @ coord. da estação`,
 com nota de metodologia explicando por que cada série vem de onde vem.
 
-### 4.5 Mapa (Leaflet + react-leaflet)
+### 4.6 Mapa (Leaflet + react-leaflet)
 
 - **Bases:** Google Streets (padrão) · Google Híbrido · Google Relevo · OSM
 - **Delimitação pelo polígono real da bacia** (não por raio), com filtro
@@ -155,7 +169,7 @@ com nota de metodologia explicando por que cada série vem de onde vem.
 - Botões de enquadramento: **Bacia · Inundação · Endereço**
 - CSS do Leaflet adaptado ao tema escuro; `z-index: 0` para não conflitar com o header
 
-### 4.6 Consulta de endereço e alerta de risco
+### 4.7 Consulta de endereço e alerta de risco
 
 **Título:** *"Consulte um endereço para saber se você se encontra em área de
 risco de alagamentos"*
@@ -188,7 +202,7 @@ risco de alagamentos"*
 - Fecha com ESC, clique no fundo ou botão; **não reabre a cada refresh**
   (controlado por chave do endereço); botão "Ver alerta" para reabrir
 
-### 4.7 Modelagem de cenário de alagamento (experimental)
+### 4.8 Modelagem de cenário de alagamento (experimental)
 
 **Cadeia:** chuva → escoamento → vazão → cota → mancha
 
@@ -320,7 +334,8 @@ src/
 │   ├── flood.ts                   # camadas de inundação e risco
 │   ├── floodData.ts               # geometria da mancha de 2024 (embarcada)
 │   ├── floodModel.ts              # modelagem hidrológica e terreno
-│   └── geocode.ts                 # Nominatim + BrasilAPI
+│   ├── geocode.ts                 # Nominatim + BrasilAPI
+│   └── weather.ts                 # previsão Campo Bom: ECMWF IFS + GFS
 └── components/
     ├── Brasao.tsx                 # brasão com cadeia de fallback
     ├── RiverChart.tsx             # curva de elevação + barras de chuva
@@ -328,6 +343,7 @@ src/
     ├── RainMap.tsx                # mapa da bacia
     ├── AddressRisk.tsx            # consulta de endereço
     ├── FloodAlertModal.tsx        # pop-up de alerta
+    ├── WeatherForecast.tsx        # previsão diária ECMWF + GFS
     └── FloodForecast.tsx          # modelagem de cenário
 ```
 
@@ -339,6 +355,7 @@ src/
 - **Limite da bacia:** ANA — Divisão Hidrográfica Nacional (`DMI_CD 10943225`)
 - **Mancha de inundação 2024:** Prefeitura Municipal de Campo Bom
 - **Chuva:** Open-Meteo (ECMWF / ERA5) nas coordenadas das estações da ANA
+- **Previsão do tempo:** Open-Meteo · modelos ECMWF IFS e NOAA GFS · coordenadas de Campo Bom
 - **Elevação:** NASA/USGS SRTM · ESA/Airbus Copernicus DEM
 - **Endereços:** Nominatim/OpenStreetMap · BrasilAPI
 - **Mapas base:** Google Maps · OpenStreetMap
