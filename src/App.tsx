@@ -5,9 +5,11 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
+  Bot,
   CloudRain,
   Droplets,
   Gauge,
+  LayoutDashboard,
   Layers,
   Map as MapIcon,
   MapPin,
@@ -22,6 +24,9 @@ import WeatherForecast from './components/WeatherForecast';
 import LevelGauge from './components/LevelGauge';
 import Brasao from './components/Brasao';
 import RainMap from './components/RainMap';
+import BotSettings from './components/BotSettings';
+import TelegramBridge from './components/TelegramBridge';
+import TelegramSubscribe from './components/TelegramSubscribe';
 import {
   attachBasinRain,
   fetchRain,
@@ -35,6 +40,7 @@ import { FLOOD_META, loadFloodSetSync, type FloodSet } from './lib/flood';
 import AddressRisk, { type AddressPoint } from './components/AddressRisk';
 import FloodAlertModal from './components/FloodAlertModal';
 import IphForecast from './components/IphForecast';
+import { clearBotToken, loginBot, reportRiverReading } from './lib/botApi';
 // import UpstreamRisk from './components/UpstreamRisk'; // desativado temporariamente
 import {
   COTAS,
@@ -93,6 +99,7 @@ export default function App() {
   const [isAdmin, setIsAdmin] = useState(() => sessionStorage.getItem('cb-admin') === '1');
   const [showLogin, setShowLogin] = useState(false);
   const [loginError, setLoginError] = useState(false);
+  const [tab, setTab] = useState<'painel' | 'bot'>('painel');
 
   const cfg = useMemo(() => PERIODS.find((p) => p.key === period)!, [period]);
   const inFlight = useRef(false);
@@ -108,6 +115,15 @@ export default function App() {
       setSource(res.source);
       setFetchedAt(res.fetchedAt);
       setError(null);
+      const latest = res.readings[res.readings.length - 1];
+      if (latest) {
+        reportRiverReading({
+          level: latest.level,
+          ts: latest.ts,
+          flow: latest.flow,
+          rain: latest.rain,
+        });
+      }
       // chuva da bacia (não bloqueia o painel de nível se falhar)
       fetchRain(days, res.readings)
         .then(setRain)
@@ -161,6 +177,10 @@ export default function App() {
       window.removeEventListener('focus', onFocus);
     };
   }, [fetchedAt, cfg.fetchDays, load]);
+
+  useEffect(() => {
+    if (!isAdmin) setTab('painel');
+  }, [isAdmin]);
 
   /* ---------------- derivados ---------------- */
 
@@ -371,9 +391,42 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {isAdmin && (
+            <nav className="mx-auto flex max-w-7xl gap-1 px-4 pb-2 sm:px-6 lg:px-8" aria-label="Painel administrativo">
+              <button
+                type="button"
+                onClick={() => setTab('painel')}
+                className={`inline-flex items-center gap-1.5 rounded-t-lg px-3 py-2 text-xs font-semibold transition ${
+                  tab === 'painel'
+                    ? 'bg-slate-900/80 text-white ring-1 ring-white/10'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <LayoutDashboard className="h-3.5 w-3.5" />
+                Painel
+              </button>
+              <button
+                type="button"
+                onClick={() => setTab('bot')}
+                className={`inline-flex items-center gap-1.5 rounded-t-lg px-3 py-2 text-xs font-semibold transition ${
+                  tab === 'bot'
+                    ? 'bg-slate-900/80 text-white ring-1 ring-white/10'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Bot className="h-3.5 w-3.5" />
+                Configurações do Bot
+              </button>
+            </nav>
+          )}
         </header>
 
         <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+          {isAdmin && tab === 'bot' ? (
+            <BotSettings />
+          ) : (
+          <>
           {/* ---------- Avisos ---------- */}
           {error && (
             <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
@@ -416,6 +469,8 @@ export default function App() {
               </div>
             </div>
           )}
+
+          <TelegramSubscribe />
 
           {/* ---------- KPIs ---------- */}
           <section className="grid grid-cols-1 gap-4 lg:grid-cols-12">
@@ -860,6 +915,8 @@ export default function App() {
               </p>
             </div>
           </section>
+          </>
+          )}
         </main>
 
         <footer className="border-t border-slate-800 bg-slate-950">
@@ -888,7 +945,9 @@ export default function App() {
                 <button
                   onClick={() => {
                     sessionStorage.removeItem('cb-admin');
+                    clearBotToken();
                     setIsAdmin(false);
+                    setTab('painel');
                   }}
                   className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-700 px-3 py-1.5 text-[11px] font-semibold text-slate-500 transition hover:border-slate-600 hover:text-slate-300"
                 >
@@ -929,14 +988,20 @@ export default function App() {
           <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm" onClick={() => setShowLogin(false)} />
           <form
             className="relative w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const form = e.currentTarget;
               const user = (form.elements.namedItem('user') as HTMLInputElement).value;
               const pass = (form.elements.namedItem('pass') as HTMLInputElement).value;
               if (user === 'admin' && pass === 'CBdefesacivil2026') {
                 sessionStorage.setItem('cb-admin', '1');
+                try {
+                  await loginBot(user, pass);
+                } catch {
+                  /* o painel abre mesmo se a API estiver indisponível */
+                }
                 setIsAdmin(true);
+                setTab('bot');
                 setShowLogin(false);
                 setLoginError(false);
               } else {
@@ -946,7 +1011,7 @@ export default function App() {
           >
             <h3 className="text-base font-bold text-white">🔒 Acesso restrito</h3>
             <p className="mt-1 text-xs text-slate-400">
-              Painel técnico com modelo de previsão estatístico. Acesso exclusivo para equipe autorizada.
+              Painel técnico, modelo de previsão e configurações do bot Telegram. Acesso exclusivo para equipe autorizada.
             </p>
 
             <label className="mt-4 block text-[11px] font-semibold uppercase tracking-wider text-slate-500">
