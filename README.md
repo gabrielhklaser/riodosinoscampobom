@@ -70,8 +70,8 @@ sudo systemctl restart riodosinoscampobom
 
 No rodapé do site: **Acesso restrito**
 
-- Usuário: `admin`
-- Senha: `CBdefesacivil2026`
+- Usuário: `*****`
+- Senha: `********`
 
 Aba **Configurações do Bot**: cotas, mensagens, destinatários e histórico de disparos.
 
