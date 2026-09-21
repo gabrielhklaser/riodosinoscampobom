@@ -63,6 +63,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🟡 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Atenção ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nMantenha atenção e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
   },
   {
     id: 'alerta',
@@ -72,6 +75,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🟠 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Alerta ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nPrepare-se: identifique rotas de fuga e mantenha documentos acessíveis.\nDefesa Civil: (51) 3597-3683 · 199',
   },
   {
     id: 'inundacao',
@@ -81,6 +87,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🔴 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Inundação ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nResidentes de áreas de risco: preparem-se para deixar a área. Não atravesse a margem.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
   },
 ];
 
@@ -109,7 +118,15 @@ function loadStore() {
     return {
       ...base,
       ...raw,
-      thresholds: Array.isArray(raw.thresholds) && raw.thresholds.length ? raw.thresholds : base.thresholds,
+      // garante os campos de pré-alerta (migração de stores antigos)
+      thresholds: (Array.isArray(raw.thresholds) && raw.thresholds.length ? raw.thresholds : base.thresholds).map((t) => {
+        const d = base.thresholds.find((x) => x.id === t.id);
+        return {
+          ...t,
+          preWarningM: t.preWarningM != null ? Number(t.preWarningM) || 0 : d ? d.preWarningM : 0,
+          preWarningMessage: t.preWarningMessage != null ? String(t.preWarningMessage) : d ? d.preWarningMessage : '',
+        };
+      }),
       subscribers: Array.isArray(raw.subscribers) ? raw.subscribers : [],
       fired: raw.fired && typeof raw.fired === 'object' ? raw.fired : {},
       log: Array.isArray(raw.log) ? raw.log.slice(-80) : [],
@@ -214,30 +231,32 @@ async function sendTelegram(chatId, text) {
   }
 }
 
-function interpolate(template, reading, threshold) {
+function interpolate(template, reading, threshold, preM = 0) {
   const hora = reading.ts
     ? new Date(reading.ts).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
     : new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   const nivel = Number(reading.level).toFixed(2).replace('.', ',');
   const cota = Number(threshold.meters).toFixed(2).replace('.', ',');
+  const pre = Number(threshold.meters - preM).toFixed(2).replace('.', ',');
   const vazao = reading.flow != null ? Number(reading.flow).toFixed(1).replace('.', ',') : '—';
   return String(template || '')
     .replaceAll('{nivel}', nivel)
     .replaceAll('{level}', nivel)
     .replaceAll('{cota}', cota)
+    .replaceAll('{pre}', pre)
     .replaceAll('{nome}', threshold.name)
     .replaceAll('{hora}', hora)
     .replaceAll('{vazao}', vazao);
 }
 
-async function dispatchThreshold(threshold, reading, reason) {
+async function dispatchThreshold(threshold, reading, reason, preM = 0) {
   const isTest = reason === 'teste_manual';
   // Teste vai marcado: o texto real do alerta não pode ser indistinguível
   // de um teste — num evento real, um "teste" sem marca apaga a confiança
   // dos inscritos no alerta.
-  const body = interpolate(threshold.message, reading, threshold);
+  const body = interpolate(threshold.message, reading, threshold, preM);
   const text = isTest
-    ? `🧪 TESTE — não é um alerta real (mensagem do limite "${threshold.name}").\n\n${body}`
+    ? `🧪 TESTE — não é um alerta real (mensagem do limite "${threshold.name}"${preM > 0 ? ' · pré-aviso' : ''}).\n\n${body}`
     : body;
   const targets = store.subscribers.filter((s) => s.active !== false);
   const results = [];
@@ -313,6 +332,26 @@ async function evaluateReading(reading) {
 
   for (const t of enabled) {
     const above = reading.level + 1e-9 >= Number(t.meters);
+
+    // PRÉ-AVISO: dispara quando a leitura cruza (cota - pré-alerta),
+    // enquanto o nível ainda está ABAIXO da cota principal. Se a leitura
+    // pular direto para cima da cota, ganha o alerta principal (sem
+    // pré-aviso duplo). Recua a marca quando o nível desce, para poder
+    // avisar de novo se subir outra vez.
+    const preM = Number(t.preWarningM) > 0 ? Number(t.preWarningM) : 0;
+    if (preM > 0 && t.preWarningMessage && !above) {
+      const preLevel = Number(t.meters) - preM;
+      const preFired = store.fired[`${t.id}:pre`];
+      if (reading.level + 1e-9 >= preLevel && !preFired) {
+        store.fired[`${t.id}:pre`] = { ts: Date.now(), level: reading.level };
+        saveStore();
+        const entry = await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'pre_alerta', preM);
+        dispatched.push(entry);
+      } else if (reading.level < preLevel && preFired) {
+        delete store.fired[`${t.id}:pre`];
+      }
+    }
+
     if (above && !store.fired[t.id]) {
       store.fired[t.id] = { ts: Date.now(), level: reading.level };
       saveStore();
@@ -320,6 +359,7 @@ async function evaluateReading(reading) {
       dispatched.push(entry);
     } else if (!above && store.fired[t.id]) {
       delete store.fired[t.id];
+      delete store.fired[`${t.id}:pre`];
     }
   }
 
@@ -645,10 +685,20 @@ function normalizeThreshold(input, fallback = {}) {
   const meters = Number(String(input.meters ?? fallback.meters ?? '').toString().replace(',', '.'));
   const message = String(input.message ?? fallback.message ?? '').trim();
   const enabled = input.enabled == null ? fallback.enabled !== false : !!input.enabled;
+  // pré-alerta: distância (m) ANTES da cota; 0 = desativado
+  const rawPre = input.preWarningM === '' || input.preWarningM == null ? fallback.preWarningM : input.preWarningM;
+  const preWarningM = Number(String(rawPre ?? 0).replace(',', '.'));
+  const preWarningMessage =
+    input.preWarningMessage == null
+      ? String(fallback.preWarningMessage ?? '')
+      : String(input.preWarningMessage).trim();
   if (!name) throw new Error('informe o nome do limite');
   if (!Number.isFinite(meters) || meters <= 0 || meters > 30) throw new Error('cota inválida (metros)');
   if (!message) throw new Error('informe a mensagem do alerta');
-  return { name, meters: +meters.toFixed(2), message, enabled };
+  if (!Number.isFinite(preWarningM) || preWarningM < 0 || preWarningM > 5) {
+    throw new Error('pré-alerta inválido (use 0 a 5 m antes da cota; 0 desativa)');
+  }
+  return { name, meters: +meters.toFixed(2), message, enabled, preWarningM: +preWarningM.toFixed(2), preWarningMessage };
 }
 
 const MIME = {
@@ -895,8 +945,16 @@ const server = createServer(async (req, res) => {
         send(res, 404, { ok: false, error: 'limite não encontrado' });
         return;
       }
+      const preTest = body.pre === true;
+      const preM = preTest && Number(t.preWarningM) > 0 ? Number(t.preWarningM) : 0;
+      if (preTest && (preM <= 0 || !t.preWarningMessage)) {
+        send(res, 400, { ok: false, error: 'este limite não tem pré-alerta configurado (distância e mensagem)' });
+        return;
+      }
       const reading = store.lastReading || { level: t.meters, ts: Date.now(), flow: null };
-      const entry = await dispatchThreshold(t, reading, 'teste_manual');
+      const entry = preTest
+        ? await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'teste_manual', preM)
+        : await dispatchThreshold(t, reading, 'teste_manual');
       send(res, 200, { ok: true, entry, ...publicConfig() });
       return;
     }

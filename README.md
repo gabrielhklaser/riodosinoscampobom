@@ -89,6 +89,15 @@ No rodapé do site: **Acesso restrito**
 
 Aba **Configurações do Bot**: cotas, mensagens, destinatários e histórico de disparos.
 
+Cada limite tem um **Pré-aviso** opcional: a distância em metros antes da
+cota em que o bot avisa de chegada (ex.: `0,30` = avisa 0,30 m antes), com
+mensagem própria (placeholder `{pre}` = nível do pré-aviso) e `0` para
+desativar. O pré-aviso dispara uma única vez por subida; se a leitura pular
+direto para cima da cota, ganha o alerta principal. Os botões de teste
+(Send / sino) enviam a mensagem do limite — ou do pré-aviso — para todos os
+inscritos, sempre marcados com “🧪 TESTE — não é um alerta real”, sem
+afetar o estado dos alertas de verdade.
+
 ## Desenvolvimento local
 
 ```bash

@@ -31,7 +31,7 @@ import { BOT_START_LINK, BOT_USERNAME, parseChatId } from '../lib/telegramBridge
 const CARD = 'rounded-2xl border border-slate-800 bg-slate-900/70 shadow-xl shadow-black/20 ring-1 ring-white/5 backdrop-blur';
 const n2 = (v: number) => v.toFixed(2).replace('.', ',');
 
-const EMPTY_FORM = { name: '', meters: '', message: '' };
+const EMPTY_FORM = { name: '', meters: '', message: '', preWarningM: '0', preWarningMessage: '' };
 
 export default function BotSettings() {
   const [cfg, setCfg] = useState<BotConfig | null>(null);
@@ -93,7 +93,13 @@ export default function BotSettings() {
 
   function startEdit(t: BotThreshold) {
     setEditing(t);
-    setForm({ name: t.name, meters: String(t.meters).replace('.', ','), message: t.message });
+    setForm({
+      name: t.name,
+      meters: String(t.meters).replace('.', ','),
+      message: t.message,
+      preWarningM: t.preWarningM != null ? String(t.preWarningM).replace('.', ',') : '0',
+      preWarningMessage: t.preWarningMessage || '',
+    });
   }
 
   function cancelEdit() {
@@ -106,18 +112,19 @@ export default function BotSettings() {
    * para dizer quantos chats receberam ou por que falhou, em vez do
    * genérico "Alteração salva.".
    */
-  async function handleTest(t: BotThreshold) {
+  async function handleTest(t: BotThreshold, pre = false) {
     setSaving(true);
     setNotice(null);
     setError(null);
+    const oQue = pre ? `pré-aviso de “${t.name}”` : `“${t.name}”`;
     try {
-      const data = await testThreshold(t.id);
+      const data = await testThreshold(t.id, pre);
       setCfg(data);
       const e = data.entry;
       if (e.ok) {
-        setNotice(`Teste de “${t.name}” enviado para ${e.chats} chat(s) — checado no Telegram?`);
+        setNotice(`Teste do ${oQue} enviado para ${e.chats} chat(s) — checado no Telegram?`);
       } else {
-        setError(`Teste de “${t.name}” não saiu: ${e.error || 'sem destinatário inscrito'}. Veja o histórico de disparos.`);
+        setError(`Teste do ${oQue} não saiu: ${e.error || 'sem destinatário inscrito'}. Veja o histórico de disparos.`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Falha no teste de envio.');
@@ -129,7 +136,13 @@ export default function BotSettings() {
   async function submitForm(e: React.FormEvent) {
     e.preventDefault();
     const meters = Number(form.meters.replace(',', '.'));
-    const payload = { name: form.name.trim(), meters, message: form.message.trim() };
+    const payload = {
+      name: form.name.trim(),
+      meters,
+      message: form.message.trim(),
+      preWarningM: Number(String(form.preWarningM).replace(',', '.') || 0),
+      preWarningMessage: form.preWarningMessage.trim(),
+    };
     if (editing) {
       await run(() => updateThreshold(editing.id, payload));
       cancelEdit();
@@ -231,18 +244,21 @@ export default function BotSettings() {
         <div className="border-b border-slate-800 px-6 py-4">
           <h3 className="text-base font-bold text-white">Limites de alerta</h3>
           <p className="mt-0.5 text-xs text-slate-400">
-            Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'} e {'{nome}'} na
-            mensagem. Novos limites entram na comparação automaticamente. O botão <Send className="inline h-3 w-3" /> envia
-            a mensagem daquele limite para todos os inscritos, marcada com “🧪 TESTE” — sem afetar os alertas reais.
+            Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'}, {'{nome}'} e{' '}
+            {'{pre}'} na mensagem. Novos limites entram na comparação automaticamente. O <strong className="text-slate-300">Pré-aviso</strong>{' '}
+            avisa antes da cota (ex.: 0,30 m antes). O botão <Send className="inline h-3 w-3" /> envia a mensagem daquele
+            limite e o <Bell className="inline h-3 w-3" /> testa o pré-aviso — sempre marcados com “🧪 TESTE”, sem afetar
+            os alertas reais.
           </p>
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-sm">
+          <table className="w-full min-w-[860px] text-sm">
             <thead className="bg-slate-900/60 text-left text-[11px] uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-6 py-2.5 font-semibold">Limite</th>
                 <th className="px-3 py-2.5 font-semibold">Cota</th>
+                <th className="px-3 py-2.5 font-semibold">Pré-aviso</th>
                 <th className="px-3 py-2.5 font-semibold">Mensagem</th>
                 <th className="px-3 py-2.5 font-semibold">Ativo</th>
                 <th className="px-6 py-2.5 text-right font-semibold">Ações</th>
@@ -251,6 +267,8 @@ export default function BotSettings() {
             <tbody className="divide-y divide-slate-800/70">
               {(cfg?.thresholds ?? []).map((t) => {
                 const fired = cfg?.fired?.[t.id];
+                const preFired = cfg?.fired?.[`${t.id}:pre`];
+                const preM = t.preWarningM ?? 0;
                 return (
                   <tr key={t.id} className="align-top hover:bg-slate-800/40">
                     <td className="px-6 py-3">
@@ -261,8 +279,23 @@ export default function BotSettings() {
                           Disparado em {n2(fired.level)} m
                         </p>
                       )}
+                      {preFired && !fired && (
+                        <p className="mt-1 text-[10px] font-semibold text-amber-300/80">
+                          Pré-avisado em {n2(preFired.level)} m
+                        </p>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-3 font-bold tabular-nums text-sky-300">{n2(t.meters)} m</td>
+                    <td className="whitespace-nowrap px-3 py-3 text-xs tabular-nums">
+                      {preM > 0 ? (
+                        <>
+                          <span className="font-semibold text-amber-300">{n2(t.meters - preM)} m</span>
+                          <span className="block text-[10px] text-slate-600">({n2(preM)} m antes)</span>
+                        </>
+                      ) : (
+                        <span className="text-slate-600">desativado</span>
+                      )}
+                    </td>
                     <td className="px-3 py-3 text-xs leading-relaxed text-slate-400">
                       <pre className="max-w-md whitespace-pre-wrap font-sans">{t.message}</pre>
                     </td>
@@ -290,6 +323,14 @@ export default function BotSettings() {
                         >
                           <Send className="h-3.5 w-3.5" />
                         </IconBtn>
+                        {preM > 0 && (
+                          <IconBtn
+                            title={`Testar o pré-aviso deste limite (dispara em ${n2(t.meters - preM)} m) para todos os inscritos (sai marcado como TESTE)`}
+                            onClick={() => handleTest(t, true)}
+                          >
+                            <Bell className="h-3.5 w-3.5" />
+                          </IconBtn>
+                        )}
                         {!t.builtin && (
                           <IconBtn title="Excluir" danger onClick={() => run(() => deleteThreshold(t.id))}>
                             <Trash2 className="h-3.5 w-3.5" />
@@ -351,6 +392,22 @@ export default function BotSettings() {
               placeholder="6,20"
             />
           </label>
+          <label className="md:col-span-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Pré-aviso (m antes da cota)
+            </span>
+            <input
+              inputMode="decimal"
+              min={0}
+              max={5}
+              step={0.1}
+              value={form.preWarningM}
+              onChange={(e) => setForm((f) => ({ ...f, preWarningM: e.target.value }))}
+              className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm tabular-nums text-slate-100 placeholder:text-slate-600 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              placeholder="0,30"
+            />
+            <span className="mt-1 block text-[10px] text-slate-600">0 desativa. Ex.: 0,30 avisa 0,30 m antes do nível.</span>
+          </label>
           <label className="md:col-span-6">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Mensagem do Telegram</span>
             <textarea
@@ -361,6 +418,21 @@ export default function BotSettings() {
               className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
               placeholder={'⚠️ ALERTA — Defesa Civil de Campo Bom\nNível atual: {nivel} m (cota {cota} m)'}
             />
+          </label>
+          <label className="md:col-span-6">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Mensagem do pré-aviso (opcional — placeholders {'{nivel}'}, {'{cota}'}, {'{pre}'}, {'{nome}'}, {'{hora}'})
+            </span>
+            <textarea
+              rows={3}
+              value={form.preWarningMessage}
+              onChange={(e) => setForm((f) => ({ ...f, preWarningMessage: e.target.value }))}
+              className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              placeholder={'🟡 PRÉ-AVISO — Defesa Civil de Campo Bom\nO Rio dos Sinos está se aproximando do nível de {nome} ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).'}
+            />
+            <span className="mt-1 block text-[10px] text-slate-600">
+              Só envia quando a distância acima for maior que 0. Sem mensagem, o pré-aviso não dispara.
+            </span>
           </label>
           <div className="md:col-span-6">
             <button
@@ -515,6 +587,10 @@ export default function BotSettings() {
                     {row.reason === 'teste_manual' ? (
                       <span className="ml-1.5 rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-semibold text-slate-300">
                         teste
+                      </span>
+                    ) : row.reason === 'pre_alerta' ? (
+                      <span className="ml-1.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                        pré-aviso
                       </span>
                     ) : (
                       <span className="ml-1.5 rounded bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-orange-300">
