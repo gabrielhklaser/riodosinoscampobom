@@ -4,7 +4,7 @@
  */
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync } from 'node:fs';
-import { dirname, extname, join } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -642,6 +642,58 @@ function normalizeThreshold(input, fallback = {}) {
   if (!Number.isFinite(meters) || meters <= 0 || meters > 30) throw new Error('cota inválida (metros)');
   if (!message) throw new Error('informe a mensagem do alerta');
   return { name, meters: +meters.toFixed(2), message, enabled };
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+/**
+ * Serve o build estático de DIST_DIR.
+ *  - bloqueia path traversal (só arquivos DENTRO de DIST_DIR);
+ *  - rota sem arquivo correspondente cai no index.html (SPA);
+ *  - retorna true quando atendeu, false para 404.
+ */
+function serveStatic(req, res, pathname) {
+  if (!existsSync(DIST_DIR)) return false;
+  let name;
+  try {
+    name = decodeURIComponent(pathname || '/');
+  } catch {
+    return false;
+  }
+  const file = resolve(DIST_DIR, name.replace(/^\/+/, ''));
+  if (file !== DIST_DIR && !file.startsWith(DIST_DIR + sep)) return false;
+
+  let target = file;
+  if (!existsSync(target) || statSync(target).isDirectory()) {
+    const index = join(DIST_DIR, 'index.html');
+    if (req.method === 'GET' && existsSync(index)) target = index;
+    else return false;
+  }
+
+  const body = readFileSync(target);
+  const isIndex = target === join(DIST_DIR, 'index.html');
+  res.writeHead(200, {
+    'Content-Type': MIME[extname(target).toLowerCase()] || 'application/octet-stream',
+    'Content-Length': body.length,
+    // index.html sempre fresco (deploy novo); assets podem ficar em cache
+    'Cache-Control': isIndex ? 'no-store' : 'public, max-age=3600',
+  });
+  res.end(req.method === 'HEAD' ? undefined : body);
+  return true;
 }
 
 const server = createServer(async (req, res) => {
