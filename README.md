@@ -30,13 +30,27 @@ O painel e a API sobem na porta `PORT` (padrão **3001**). O bot autentica em `@
 
 | Variável | Função |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | Token do BotFather |
+| `TELEGRAM_BOT_TOKEN` | **Obrigatória.** Token do BotFather (nunca commite o valor real) |
 | `TELEGRAM_BOT_USERNAME` | `defesacivilcampobom_bot` |
-| `ADMIN_USER` / `ADMIN_PASSWORD` | Login do painel técnico |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | **Obrigatória a senha.** Login do painel técnico (o servidor não inicia sem ela) |
 | `PORT` | Porta HTTP (hosts como Render/Railway injetam sozinhos) |
-| `TELEGRAM_WEBHOOK_URL` | Opcional. Se o site tiver HTTPS público, use `https://SEU-DOMINIO/api/telegram/webhook` |
+| `TELEGRAM_WEBHOOK_URL` | Opcional. Se o site tiver HTTPS público, use `https://SEU-DOMINIO/api/telegram/webhook?secret_token=um-segredo-aleatorio` — o `secret_token` faz o servidor validar a origem do webhook |
 
 Sem `TELEGRAM_WEBHOOK_URL` o bot usa **polling** — funciona em VPS, mesmo sem domínio.
+
+### ⚠️ Credenciais (leia antes de subir)
+
+- O repositório já foi publicado com o token antigo do bot e a senha antiga do
+  painel em texto plano. **Considere ambos vazados:**
+  1. No BotFather, envie `/revoke` para `@defesacivilcampobom_bot` e copie o token novo;
+  2. Escolha uma nova senha forte para `ADMIN_PASSWORD`.
+- O servidor **recusa iniciar** sem `TELEGRAM_BOT_TOKEN` e `ADMIN_PASSWORD` no `.env`
+  (mensagem de log diz exatamente o que falta).
+- O token do bot **não é mais enviado** ao navegador em `/api/bot/config`.
+  Só volta a ser exposto (para administradores) se você definir
+  `TELEGRAM_BROWSER_BRIDGE=1` — fallback de emergência; mantenha desligado em produção.
+- Rollback dessas mudanças: `git revert` do commit — mas o token antigo
+  continuaria válido enquanto não for revogado no BotFather.
 
 ### systemd (VPS)
 
@@ -70,16 +84,31 @@ sudo systemctl restart riodosinoscampobom
 
 No rodapé do site: **Acesso restrito**
 
-- Usuário: `*****`
-- Senha: `********`
+- Usuário/senha: definidos em `.env` (`ADMIN_USER` / `ADMIN_PASSWORD`) —
+  não são publicados neste README (nunca commite o `.env` com valores reais).
 
 Aba **Configurações do Bot**: cotas, mensagens, destinatários e histórico de disparos.
 
 ## Desenvolvimento local
 
 ```bash
+cp .env.example .env   # preencha o token e a senha antes!
 npm install
 npm run dev
 ```
 
 Sobe a API em `:3001` e o Vite em `:5173` (com proxy `/api`).
+
+## Solução de problemas
+
+Sintoma → causa provável → o que fazer:
+
+| Sintoma | Causa provável | O que fazer |
+|---|---|---|
+| Servidor não inicia; log diz `Variável(is) ausente(s) no .env` | `.env` inexistente ou incompleto | `cp .env.example .env`, preencha `TELEGRAM_BOT_TOKEN` e `ADMIN_PASSWORD`, suba de novo |
+| Log `[bot] falha ao autenticar: ...` | Token errado/revogado | Gere token novo no BotFather (`/revoke` → `/token`) e atualize o `.env`; reinicie |
+| Bot offline (`/api/health` → `online: false`) | Sem saída para `api.telegram.org` (comum em preview/sandbox) | Em VPS com internet, o polling resolve sozinho. No painel, a aba Configurações mostra `lastError` com o motivo exato |
+| Painel sem dados do rio | ANA fora do ar ou proxies CORS sem resposta | Aguarde a próxima atualização; o servidor grava a última leitura e o log `[ana]` mostra o erro exato |
+| Curva de projeção sem remanso / sem dados em estações ANA | Estação a montante fora do ar | `console.warn` no DevTools (F12) diz qual estação falhou; o restante da curva continua válido (degradação graciosa) |
+| Alertas não chegam no Telegram | Bot offline ou sem inscritos | Verifique o histórico de disparos na aba Configurações (`log`): o campo `error` diz o motivo (ex.: `Nenhum destinatário inscrito`) |
+| Webhook rejeitado (`403 secret_token inválido`) | Webhook configurado sem o `secret_token` da URL do `.env` | Registre o webhook com o mesmo `secret_token` de `TELEGRAM_WEBHOOK_URL`, ou remova o `secret_token` da URL |

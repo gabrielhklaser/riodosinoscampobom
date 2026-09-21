@@ -26,7 +26,7 @@ import {
   type BotConfig,
   type BotThreshold,
 } from '../lib/botApi';
-import { BOT_START_LINK, BOT_USERNAME, parseChatId, telegramSend } from '../lib/telegramBridge';
+import { BOT_START_LINK, BOT_USERNAME, parseChatId } from '../lib/telegramBridge';
 
 const CARD = 'rounded-2xl border border-slate-800 bg-slate-900/70 shadow-xl shadow-black/20 ring-1 ring-white/5 backdrop-blur';
 const n2 = (v: number) => v.toFixed(2).replace('.', ',');
@@ -44,7 +44,6 @@ export default function BotSettings() {
   const [chatId, setChatId] = useState('6810701338');
   const [chatName, setChatName] = useState('Administrador');
   const [needLogin, setNeedLogin] = useState(false);
-  const [bridge, setBridge] = useState<{ ok: boolean; error?: string } | null>(null);
 
   async function refresh() {
     const data = await fetchBotConfig();
@@ -70,15 +69,9 @@ export default function BotSettings() {
     const id = setInterval(() => {
       refresh().catch(() => undefined);
     }, 15000);
-    const onBridge = (ev: Event) => {
-      const detail = (ev as CustomEvent).detail as { ok: boolean; error?: string };
-      setBridge(detail);
-    };
-    window.addEventListener('cb-bot-status', onBridge);
     return () => {
       alive = false;
       clearInterval(id);
-      window.removeEventListener('cb-bot-status', onBridge);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -412,18 +405,13 @@ export default function BotSettings() {
             }
             await run(async () => {
               const data = await addSubscriber(id, chatName.trim());
-              if (data.telegramToken) {
-                await telegramSend(
-                  data.telegramToken,
-                  id,
-                  `Inscrição confirmada.\nVocê receberá os alertas de cota do Rio dos Sinos em Campo Bom.\nAbra @${BOT_USERNAME} e envie /start se ainda não enviou.`,
-                );
-              }
               setChatId('');
               setChatName('');
               return data;
             });
-            setNotice(`Destinatário ${id} cadastrado. Uma mensagem de confirmação foi enviada no Telegram.`);
+            // a confirmação sai pela fila do servidor (outbox) quando ele
+            // está online no Telegram — o token não é exposto ao navegador
+            setNotice(`Destinatário ${id} cadastrado. A mensagem de confirmação será enviada pelo servidor.`);
           }}
         >
           <input

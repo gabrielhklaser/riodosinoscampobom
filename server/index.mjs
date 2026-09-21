@@ -14,11 +14,14 @@ const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '0.0.0.0';
 
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'CBdefesacivil2026';
+// SEM fallback: sem senha no .env o servidor não sobe (o token de admin é
+// derivado dela — default público seria explorável por qualquer um).
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
-/** Placeholder do token — sobrescrito por TELEGRAM_BOT_TOKEN. */
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN || '8935755114:AAEds6Dm1PLVL_XSjwdeW4CXWuzZmLRgrZo';
+// SEM fallback com token real em código: o antigo token estava commitado
+// num repositório público e deve ser considerado vazado (rodar /revoke no
+// BotFather). Defina o token novo no .env.
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_BOT_USERNAME = (process.env.TELEGRAM_BOT_USERNAME || 'defesacivilcampobom_bot').replace(
   /^@/,
   '',
@@ -29,7 +32,24 @@ const STORE_FILE = join(DATA_DIR, 'bot-config.json');
 const DIST_DIR = join(__dirname, '..', 'dist');
 const TG = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_WEBHOOK_URL = (process.env.TELEGRAM_WEBHOOK_URL || '').trim();
+// Fallback de emergência: permite que o navegador do admin converse direto
+// com o Telegram (e, com isso, o /api/bot/config expõe o token para
+// administradores). Mantenha DESLIGADO em produção.
 const EXPOSE_BROWSER_BRIDGE = process.env.TELEGRAM_BROWSER_BRIDGE === '1';
+
+/* ------------------------ checagem de credenciais ------------------------ */
+const missingEnv = [];
+if (!ADMIN_PASSWORD) missingEnv.push('ADMIN_PASSWORD');
+if (!TELEGRAM_BOT_TOKEN) missingEnv.push('TELEGRAM_BOT_TOKEN');
+if (missingEnv.length) {
+  console.error(`[setup] Variável(is) ausente(s) no .env: ${missingEnv.join(', ')}.`);
+  console.error('[setup] O servidor não inicia sem credenciais. Copie .env.example para .env e preencha:');
+  console.error('  TELEGRAM_BOT_TOKEN = token do BotFather (https://t.me/BotFather → /token)');
+  console.error('  ADMIN_PASSWORD     = senha forte do painel técnico');
+  console.error('[setup] Importante: credenciais antigas já foram publicadas no repositório —');
+  console.error('gere um token novo no BotFather (/revoke) e use uma senha nova.');
+  process.exit(1);
+}
 
 const ANA_CODE = '87380000';
 const ANA_URL = 'https://telemetriaws1.ana.gov.br/ServiceANA.asmx/DadosHidrometeorologicos';
@@ -145,6 +165,9 @@ function ensureAdminSubscriber() {
 
 let store = loadStore();
 ensureAdminSubscriber();
+
+/** limite de taxa do POST /api/bot/reading (1 por 60 s, global) */
+let lastReadingPushAt = 0;
 
 /* ------------------------------------------------------------------ */
 /* Auth                                                                */
@@ -591,7 +614,9 @@ function publicConfig() {
     lastReading: store.lastReading,
     fired: store.fired,
     log: store.log.slice(0, 40),
-    telegramToken: TELEGRAM_BOT_TOKEN,
+    // Nunca expor o token por padrão: quem tem o token controla o bot.
+    // Só vai no payload quando TELEGRAM_BROWSER_BRIDGE=1 (fallback de emergência).
+    telegramToken: EXPOSE_BROWSER_BRIDGE ? TELEGRAM_BOT_TOKEN : undefined,
     outboxCount: Array.isArray(store.outbox) ? store.outbox.length : 0,
     subscribeLink: `https://t.me/${TELEGRAM_BOT_USERNAME}?start=alerta`,
   };
@@ -645,11 +670,31 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && path === '/api/telegram/webhook') {
+      // secret_token (Telegram só envia updates para um webhook configurado
+      // com o mesmo segredo) — evita que qualquer pessoa que saiba da URL
+      // injete "updates" falsos (spam para chats arbitrários + poluição da
+      // lista de inscritos). Só exigido quando o bridge do navegador está
+      // desligado — o bridge registra o webhook sem segredo.
+      const expectedSecret = (() => {
+        try {
+          return new URL(TELEGRAM_WEBHOOK_URL).searchParams.get('secret_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+      if (!EXPOSE_BROWSER_BRIDGE && expectedSecret && url.searchParams.get('secret_token') !== expectedSecret) {
+        send(res, 403, { ok: false, error: 'secret_token inválido' });
+        return;
+      }
       const body = await readBody(req);
+      // update bem-formado: update_id inteiro crescente (o Telegram é a
+      // única fonte legítima de updates válidos)
+      if (!Number.isInteger(body?.update_id) || body.update_id <= 0) {
+        send(res, 400, { ok: false, error: 'update inválido' });
+        return;
+      }
       const reply = commandReply(body);
-      store.bot.ok = true;
-      store.bot.lastError = null;
-      saveStore();
+      // não marcamos bot.ok aqui: o status real vem do polling/verifyBot
       if (reply) {
         send(res, 200, {
           method: 'sendMessage',
@@ -673,10 +718,28 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    /* leitura pública: o painel (e a rotina ANA) enviam o nível atual */
+    /* leitura pública: o painel envia o nível atual para o bot avaliar.
+     * Endpoint sem autenticação (o painel público é anônimo), então aplica
+     * limite de taxa e sanidade: sem isso qualquer um poderia disparar
+     * alertas de enchente falsos para todos os inscritos. */
     if (req.method === 'POST' && path === '/api/bot/reading') {
       const body = await readBody(req);
       const level = Number(String(body.level ?? '').toString().replace(',', '.'));
+      const nowMs = Date.now();
+      if (nowMs - lastReadingPushAt < 60000) {
+        send(res, 429, { ok: false, error: 'envio frequente demais — aguarde 60 s' });
+        return;
+      }
+      if (!Number.isFinite(level) || level < 0.5 || level > 12) {
+        send(res, 400, { ok: false, error: 'nível fora da faixa plausível (0,5–12 m)' });
+        return;
+      }
+      const last = store.lastReading;
+      if (last && Number.isFinite(last.level) && Math.abs(level - last.level) > 2.0) {
+        send(res, 400, { ok: false, error: 'salto de nível improvável (±2 m) — leitura ignorada' });
+        return;
+      }
+      lastReadingPushAt = nowMs;
       const result = await evaluateReading({
         level,
         ts: body.ts || Date.now(),
