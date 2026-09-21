@@ -54,6 +54,187 @@ if (missingEnv.length) {
 const ANA_CODE = '87380000';
 const ANA_URL = 'https://telemetriaws1.ana.gov.br/ServiceANA.asmx/DadosHidrometeorologicos';
 
+/* ------------------- INMET: avisos meteorológicos (proxy+cache) -------------------
+ * Fonte oficial: https://apiprevmet3.inmet.gov.br/avisos/ativos  (JSON público,
+ * sem chave). O endpoint antigo dos tutoriais (apitempo.inmet.gov.br/avisos/ativos)
+ * não existe mais — use apiprevmet3.
+ *
+ * Resiliência: timeout de 5 s, cache em memória com TTL de 12 min (a API do
+ * INMET não muda segundo a segundo e consultas diretas de muitos navegadores
+ * podem travar a instância do Render). Se a INMET estiver fora do ar, o
+ * painel NÃO quebra: devolvemos a última lista válida com fallback=true,
+ * ou lista vazia se ainda não houver nada em cache.
+ *
+ * INMET_API_URL e INMET_CACHE_TTL_MS podem ser sobrescritas por env
+ * (útil em testes/staging).
+ */
+const INMET_URL = (process.env.INMET_API_URL || 'https://apiprevmet3.inmet.gov.br/avisos/ativos').trim();
+const INMET_CACHE_TTL_MS = Number(process.env.INMET_CACHE_TTL_MS || 12 * 60 * 1000);
+const INMET_TIMEOUT_MS = 5000;
+// Centro de Campo Bom/RS (ponto de referência para o fallback de polígono)
+const CAMPO_BOM = { nome: 'Campo Bom', uf: 'RS', codigoIbge: '4303905', lat: -29.4322, lon: -51.3506 };
+
+const SEVERIDADE_RANK = { amarelo: 1, laranja: 2, vermelho: 3 };
+
+function normalizarSeveridade(aviso) {
+  // Aceita os rótulos em pt-BR ("Perigo Potencial"/"Perigo"/"Grande Perigo"),
+  // em inglês ("Moderate"/"Severe"/"Extreme") e a cor do aviso. "Perigo
+  // Potencial" tem de ser testado ANTES de "Perigo" (o substring engana).
+  const cor = String(aviso.aviso_cor || '').toLowerCase();
+  const sev = String(aviso.severidade || '').toLowerCase();
+  const s = `${sev} ${cor}`;
+  if (!s.trim()) return 'amarelo';
+  if (/(grande perigo|extreme|vermelho|\bred\b)/.test(s)) return 'vermelho';
+  if (/(perigo potencial|potencial|moderate|amarelo|\byellow\b|aten[cç][aã]o)/.test(s)) return 'amarelo';
+  if (/(perigo|severe|laranja|orange)/.test(s)) return 'laranja';
+  return 'amarelo'; // rótulo desconhecido: segue o mais brando, mas o texto original vai no card
+}
+
+// Ray casting: o ponto (lon/lat) está dentro do anel externo do polígono?
+function pontoNoAnel(lon, lat, anel) {
+  let dentro = false;
+  for (let i = 0, j = anel.length - 1; i < anel.length; j = i++) {
+    const xi = anel[i][0], yi = anel[i][1];
+    const xj = anel[j][0], yj = anel[j][1];
+    if (yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) dentro = !dentro;
+  }
+  return dentro;
+}
+
+function pontoNoPoligono(aviso) {
+  let g = aviso.poligono;
+  if (typeof g === 'string') {
+    try {
+      g = JSON.parse(g);
+    } catch {
+      return false;
+    }
+  }
+  if (!g || typeof g !== 'object') return false;
+  const polys =
+    g.type === 'MultiPolygon' ? g.coordinates : g.type === 'Polygon' ? [g.coordinates] : null;
+  if (!Array.isArray(polys)) return false;
+  for (const poly of polys) {
+    const anel = Array.isArray(poly?.[0]) ? poly[0] : null;
+    if (anel && anel.length > 2 && pontoNoAnel(CAMPO_BOM.lon, CAMPO_BOM.lat, anel)) return true;
+  }
+  return false;
+}
+
+// O aviso cobre Campo Bom? Ordem: lista explícita de geocodes → lista de
+// municípios ("Nome - UF (IBGE)", confiável inclusive no negativo) →
+// fallback geoespacial (polígono), só quando a lista não existe.
+function cobreCampoBom(aviso) {
+  const COD = CAMPO_BOM.codigoIbge;
+  if (typeof aviso.geocodes === 'string') {
+    if (aviso.geocodes.split(',').map((s) => s.trim()).includes(COD)) return true;
+  }
+  if (typeof aviso.municipios === 'string' && aviso.municipios.trim()) {
+    for (const parte of aviso.municipios.split(',')) {
+      const m = parte.match(/\((\d{7})\)\s*$/);
+      if (m && m[1] === COD) return true;
+      if (new RegExp(`^${CAMPO_BOM.nome} - ${CAMPO_BOM.uf}\\b`, 'i').test(parte.trim())) return true;
+    }
+    return false; // a lista existe e a cidade não está nela
+  }
+  return pontoNoPoligono(aviso);
+}
+
+// data_inicio vem como "2026-09-21T00:00:00.000Z" (data local, relógio
+// zerado) e hora_inicio como "09:03" (horário local de Brasília, UTC-3,
+// sem horário de verão desde 2019). Compomos o wall-clock local num epoch.
+function inmetEpoch(dataStr, horaStr) {
+  const d = String(dataStr || '').slice(0, 10);
+  const [y, mo, dia] = d.split('-').map(Number);
+  const [hh, mm] = String(horaStr || '00:00').split(':').map(Number);
+  if (!y || !mo || !dia) return null;
+  const t = Date.UTC(y, mo - 1, dia, hh || 0, mm || 0) + 3 * 3600 * 1000;
+  return new Date(t).toISOString();
+}
+
+function parseInmetAviso(raw, periodo) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = raw.id != null ? String(raw.id) : raw.codigo != null ? String(raw.codigo) : null;
+  const descricao = String(raw.descricao || '').trim();
+  if (!id || !descricao) return null;
+  const inicio =
+    raw.inicio != null ? String(raw.inicio) : inmetEpoch(raw.data_inicio, raw.hora_inicio);
+  const fim =
+    raw.fim != null ? String(raw.fim) : inmetEpoch(raw.data_fim, raw.hora_fim);
+  const riscos = Array.isArray(raw.riscos)
+    ? raw.riscos.map((r) => String(r || '').trim()).filter(Boolean)
+    : [];
+  const instrucoes = Array.isArray(raw.instrucoes)
+    ? raw.instrucoes.map((r) => String(r || '').trim()).filter(Boolean)
+    : [];
+  return {
+    id,
+    // "Aviso de Chuvas Intensas" → "Chuvas Intensas"
+    tipo: descricao.replace(/^aviso\s+de\s+/i, '').replace(/\.$/, '').trim() || descricao,
+    severidade: normalizarSeveridade(raw),
+    severidadeOriginal: raw.severidade != null ? String(raw.severidade) : null,
+    periodo, // 'hoje' (vigente) | 'futuro' (publicado, inicia depois)
+    inicio: inicio || null,
+    fim: fim || null,
+    riscos,
+    instrucoes,
+  };
+}
+
+let inmetCache = { avisos: null, ts: 0 };
+
+async function buscarAvisosInmet() {
+  const now = Date.now();
+  if (inmetCache.avisos && now - inmetCache.ts < INMET_CACHE_TTL_MS) {
+    return { avisos: inmetCache.avisos, atualizadoEm: inmetCache.ts, fallback: false };
+  }
+  try {
+    const resp = await fetch(INMET_URL, {
+      signal: AbortSignal.timeout(INMET_TIMEOUT_MS),
+      headers: { Accept: 'application/json', 'User-Agent': 'CampoBomMonitor/1.0 (painel rio dos sinos)' },
+    });
+    if (!resp.ok) throw new Error(`INMET respondeu HTTP ${resp.status}`);
+    const payload = await resp.json();
+    if (!payload || typeof payload !== 'object') throw new Error('INMET retornou payload inválido');
+
+    const buckets = [
+      ['hoje', Array.isArray(payload.hoje) ? payload.hoje : []],
+      ['futuro', Array.isArray(payload.futuro) ? payload.futuro : []],
+    ];
+    // Revisões do mesmo aviso (id_aviso + id_sequencia): mantém a última.
+    const porAviso = new Map();
+    for (const [periodo, lista] of buckets) {
+      for (const raw of lista) {
+        if (!raw || typeof raw !== 'object') continue;
+        const key = String(raw.id_aviso ?? raw.id ?? raw.codigo ?? Math.random());
+        const seq = Number(raw.id_sequencia ?? 0);
+        const prev = porAviso.get(key);
+        if (!prev || seq >= Number(prev.id_sequencia ?? 0)) porAviso.set(key, { ...raw, __periodo: periodo });
+      }
+    }
+    const avisos = [];
+    for (const raw of porAviso.values()) {
+      if (!cobreCampoBom(raw)) continue;
+      const m = parseInmetAviso(raw, raw.__periodo);
+      if (m) avisos.push(m);
+    }
+    avisos.sort(
+      (a, b) =>
+        (SEVERIDADE_RANK[b.severidade] - SEVERIDADE_RANK[a.severidade]) ||
+        String(a.inicio || '').localeCompare(String(b.inicio || '')),
+    );
+    inmetCache = { avisos, ts: now };
+    return { avisos, atualizadoEm: now, fallback: false };
+  } catch (err) {
+    // INMET fora do ar: última lista válida (com fallback=true) ou vazia.
+    if (inmetCache.avisos) {
+      return { avisos: inmetCache.avisos, atualizadoEm: inmetCache.ts, fallback: true };
+    }
+    console.error(`[inmet] indisponível: ${err?.message || err}`);
+    return { avisos: [], atualizadoEm: null, fallback: true };
+  }
+}
+
 const DEFAULT_THRESHOLDS = [
   {
     id: 'atencao',
@@ -774,6 +955,21 @@ const server = createServer(async (req, res) => {
         bot: store.bot.username,
         online: !!store.bot.ok,
         time: Date.now(),
+      });
+      return;
+    }
+
+    // Avisos meteorológicos do INMET para Campo Bom — PÚBLICO (o site é
+    // aberto) e protegido por cache/TTL + timeout na busca upstream.
+    if (req.method === 'GET' && path === '/api/alertas/campo-bom') {
+      const r = await buscarAvisosInmet();
+      send(res, 200, {
+        ok: true,
+        municipio: `${CAMPO_BOM.nome} - ${CAMPO_BOM.uf} (${CAMPO_BOM.codigoIbge})`,
+        fonte: 'INMET — Instituto Nacional de Meteorologia',
+        atualizadoEm: r.atualizadoEm,
+        fallback: r.fallback,
+        avisos: r.avisos,
       });
       return;
     }

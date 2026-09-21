@@ -35,8 +35,18 @@ O painel e a API sobem na porta `PORT` (padrão **3001**). O bot autentica em `@
 | `ADMIN_USER` / `ADMIN_PASSWORD` | **Obrigatória a senha.** Login do painel técnico (o servidor não inicia sem ela) |
 | `PORT` | Porta HTTP (hosts como Render/Railway injetam sozinhos) |
 | `TELEGRAM_WEBHOOK_URL` | Opcional. Se o site tiver HTTPS público, use `https://SEU-DOMINIO/api/telegram/webhook?secret_token=um-segredo-aleatorio` — o `secret_token` faz o servidor validar a origem do webhook |
+| `INMET_API_URL` | Opcional (testes/staging). Padrão: `https://apiprevmet3.inmet.gov.br/avisos/ativos` |
+| `INMET_CACHE_TTL_MS` | Opcional. TTL do cache dos avisos INMET, em ms (padrão: 720000 = 12 min) |
 
 Sem `TELEGRAM_WEBHOOK_URL` o bot usa **polling** — funciona em VPS, mesmo sem domínio.
+
+**Avisos meteorológicos (INMET):** o topo do painel mostra os avisos
+vigentes do INMET para Campo Bom/RS (IBGE `4303905`), nas cores oficiais
+(amarelo `#F59E0B` / laranja `#EA580C` / vermelho `#DC2626`). O navegador
+nunca fala com a INMET: o backend serve `/api/alertas/campo-bom` com
+timeout de 5 s e cache de 12 min; se o INMET estiver fora do ar, o painel
+segue no ar exibindo a última lista válida (com aviso de fallback) —
+nunca quebra.
 
 ### ⚠️ Credenciais (leia antes de subir)
 

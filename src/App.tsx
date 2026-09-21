@@ -38,6 +38,7 @@ import { BASIN_META } from './lib/basin';
 import { FLOOD_META, loadFloodSetSync, type FloodSet } from './lib/flood';
 import AddressRisk, { type AddressPoint } from './components/AddressRisk';
 import FloodAlertModal from './components/FloodAlertModal';
+import InmetAlerts from './components/InmetAlerts';
 import IphForecast from './components/IphForecast';
 import { clearBotToken, loginBot, reportRiverReading } from './lib/botApi';
 // import UpstreamRisk from './components/UpstreamRisk'; // desativado temporariamente
@@ -426,6 +427,9 @@ export default function App() {
             <BotSettings />
           ) : (
           <>
+          {/* ---------- Avisos meteorológicos INMET (topo) ---------- */}
+          <InmetAlerts />
+
           {/* ---------- Avisos ---------- */}
           {error && (
             <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
