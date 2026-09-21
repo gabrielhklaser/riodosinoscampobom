@@ -101,6 +101,31 @@ export default function BotSettings() {
     setForm(EMPTY_FORM);
   }
 
+  /**
+   * Teste de envio por limite — usa o resultado real do disparo (entry)
+   * para dizer quantos chats receberam ou por que falhou, em vez do
+   * genérico "Alteração salva.".
+   */
+  async function handleTest(t: BotThreshold) {
+    setSaving(true);
+    setNotice(null);
+    setError(null);
+    try {
+      const data = await testThreshold(t.id);
+      setCfg(data);
+      const e = data.entry;
+      if (e.ok) {
+        setNotice(`Teste de “${t.name}” enviado para ${e.chats} chat(s) — checado no Telegram?`);
+      } else {
+        setError(`Teste de “${t.name}” não saiu: ${e.error || 'sem destinatário inscrito'}. Veja o histórico de disparos.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Falha no teste de envio.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function submitForm(e: React.FormEvent) {
     e.preventDefault();
     const meters = Number(form.meters.replace(',', '.'));
@@ -207,7 +232,8 @@ export default function BotSettings() {
           <h3 className="text-base font-bold text-white">Limites de alerta</h3>
           <p className="mt-0.5 text-xs text-slate-400">
             Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'} e {'{nome}'} na
-            mensagem. Novos limites entram na comparação automaticamente.
+            mensagem. Novos limites entram na comparação automaticamente. O botão <Send className="inline h-3 w-3" /> envia
+            a mensagem daquele limite para todos os inscritos, marcada com “🧪 TESTE” — sem afetar os alertas reais.
           </p>
         </div>
 
@@ -259,8 +285,8 @@ export default function BotSettings() {
                           <Pencil className="h-3.5 w-3.5" />
                         </IconBtn>
                         <IconBtn
-                          title="Enviar teste"
-                          onClick={() => run(() => testThreshold(t.id))}
+                          title={`Testar envio desta mensagem para todos os inscritos (sai marcada como TESTE)`}
+                          onClick={() => handleTest(t)}
                         >
                           <Send className="h-3.5 w-3.5" />
                         </IconBtn>
@@ -484,7 +510,18 @@ export default function BotSettings() {
                   <td className="whitespace-nowrap px-6 py-2.5 text-slate-400">
                     {new Date(row.ts).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}
                   </td>
-                  <td className="px-3 py-2.5 text-slate-200">{row.name}</td>
+                  <td className="px-3 py-2.5 text-slate-200">
+                    {row.name}
+                    {row.reason === 'teste_manual' ? (
+                      <span className="ml-1.5 rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-semibold text-slate-300">
+                        teste
+                      </span>
+                    ) : (
+                      <span className="ml-1.5 rounded bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-orange-300">
+                        cruzou cota
+                      </span>
+                    )}
+                  </td>
                   <td className="px-3 py-2.5 text-right tabular-nums text-sky-300">{n2(row.level)} m</td>
                   <td className="px-3 py-2.5 text-right tabular-nums text-slate-400">{row.chats}</td>
                   <td className="px-6 py-2.5 text-xs">

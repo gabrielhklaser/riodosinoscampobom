@@ -231,7 +231,14 @@ function interpolate(template, reading, threshold) {
 }
 
 async function dispatchThreshold(threshold, reading, reason) {
-  const text = interpolate(threshold.message, reading, threshold);
+  const isTest = reason === 'teste_manual';
+  // Teste vai marcado: o texto real do alerta não pode ser indistinguível
+  // de um teste — num evento real, um "teste" sem marca apaga a confiança
+  // dos inscritos no alerta.
+  const body = interpolate(threshold.message, reading, threshold);
+  const text = isTest
+    ? `🧪 TESTE — não é um alerta real (mensagem do limite "${threshold.name}").\n\n${body}`
+    : body;
   const targets = store.subscribers.filter((s) => s.active !== false);
   const results = [];
 
@@ -881,9 +888,13 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && path === '/api/bot/test') {
       const body = await readBody(req);
-      const id = body.thresholdId;
-      const t = store.thresholds.find((x) => x.id === id) || store.thresholds[0];
-      if (!t) throw new Error('nenhum limite cadastrado');
+      // SEM fallback para o primeiro limite: ID inválido significa erro do
+      // cliente, e testar o limite errado ensaia a mensagem errada.
+      const t = store.thresholds.find((x) => x.id === body.thresholdId);
+      if (!t) {
+        send(res, 404, { ok: false, error: 'limite não encontrado' });
+        return;
+      }
       const reading = store.lastReading || { level: t.meters, ts: Date.now(), flow: null };
       const entry = await dispatchThreshold(t, reading, 'teste_manual');
       send(res, 200, { ok: true, entry, ...publicConfig() });

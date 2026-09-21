@@ -120,7 +120,7 @@ export function deleteThreshold(id: string) {
 }
 
 export function testThreshold(thresholdId: string) {
-  return request<BotConfig & { ok: boolean }>('/api/bot/test', {
+  return request<BotConfig & { ok: boolean; entry: BotLogEntry }>('/api/bot/test', {
     method: 'POST',
     body: JSON.stringify({ thresholdId }),
   });
