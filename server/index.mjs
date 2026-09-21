@@ -4,7 +4,7 @@
  */
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync } from 'node:fs';
-import { dirname, extname, join } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -14,11 +14,14 @@ const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '0.0.0.0';
 
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'CBdefesacivil2026';
+// SEM fallback: sem senha no .env o servidor não sobe (o token de admin é
+// derivado dela — default público seria explorável por qualquer um).
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
-/** Placeholder do token — sobrescrito por TELEGRAM_BOT_TOKEN. */
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN || '8935755114:AAEds6Dm1PLVL_XSjwdeW4CXWuzZmLRgrZo';
+// SEM fallback com token real em código: o antigo token estava commitado
+// num repositório público e deve ser considerado vazado (rodar /revoke no
+// BotFather). Defina o token novo no .env.
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_BOT_USERNAME = (process.env.TELEGRAM_BOT_USERNAME || 'defesacivilcampobom_bot').replace(
   /^@/,
   '',
@@ -29,10 +32,208 @@ const STORE_FILE = join(DATA_DIR, 'bot-config.json');
 const DIST_DIR = join(__dirname, '..', 'dist');
 const TG = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_WEBHOOK_URL = (process.env.TELEGRAM_WEBHOOK_URL || '').trim();
+// Fallback de emergência: permite que o navegador do admin converse direto
+// com o Telegram (e, com isso, o /api/bot/config expõe o token para
+// administradores). Mantenha DESLIGADO em produção.
 const EXPOSE_BROWSER_BRIDGE = process.env.TELEGRAM_BROWSER_BRIDGE === '1';
+
+/* ------------------------ checagem de credenciais ------------------------ */
+const missingEnv = [];
+if (!ADMIN_PASSWORD) missingEnv.push('ADMIN_PASSWORD');
+if (!TELEGRAM_BOT_TOKEN) missingEnv.push('TELEGRAM_BOT_TOKEN');
+if (missingEnv.length) {
+  console.error(`[setup] Variável(is) ausente(s) no .env: ${missingEnv.join(', ')}.`);
+  console.error('[setup] O servidor não inicia sem credenciais. Copie .env.example para .env e preencha:');
+  console.error('  TELEGRAM_BOT_TOKEN = token do BotFather (https://t.me/BotFather → /token)');
+  console.error('  ADMIN_PASSWORD     = senha forte do painel técnico');
+  console.error('[setup] Importante: credenciais antigas já foram publicadas no repositório —');
+  console.error('gere um token novo no BotFather (/revoke) e use uma senha nova.');
+  process.exit(1);
+}
 
 const ANA_CODE = '87380000';
 const ANA_URL = 'https://telemetriaws1.ana.gov.br/ServiceANA.asmx/DadosHidrometeorologicos';
+
+/* ------------------- INMET: avisos meteorológicos (proxy+cache) -------------------
+ * Fonte oficial: https://apiprevmet3.inmet.gov.br/avisos/ativos  (JSON público,
+ * sem chave). O endpoint antigo dos tutoriais (apitempo.inmet.gov.br/avisos/ativos)
+ * não existe mais — use apiprevmet3.
+ *
+ * Resiliência: timeout de 5 s, cache em memória com TTL de 12 min (a API do
+ * INMET não muda segundo a segundo e consultas diretas de muitos navegadores
+ * podem travar a instância do Render). Se a INMET estiver fora do ar, o
+ * painel NÃO quebra: devolvemos a última lista válida com fallback=true,
+ * ou lista vazia se ainda não houver nada em cache.
+ *
+ * INMET_API_URL e INMET_CACHE_TTL_MS podem ser sobrescritas por env
+ * (útil em testes/staging).
+ */
+const INMET_URL = (process.env.INMET_API_URL || 'https://apiprevmet3.inmet.gov.br/avisos/ativos').trim();
+const INMET_CACHE_TTL_MS = Number(process.env.INMET_CACHE_TTL_MS || 12 * 60 * 1000);
+const INMET_TIMEOUT_MS = 5000;
+// Centro de Campo Bom/RS (ponto de referência para o fallback de polígono)
+const CAMPO_BOM = { nome: 'Campo Bom', uf: 'RS', codigoIbge: '4303905', lat: -29.4322, lon: -51.3506 };
+
+const SEVERIDADE_RANK = { amarelo: 1, laranja: 2, vermelho: 3 };
+
+function normalizarSeveridade(aviso) {
+  // Aceita os rótulos em pt-BR ("Perigo Potencial"/"Perigo"/"Grande Perigo"),
+  // em inglês ("Moderate"/"Severe"/"Extreme") e a cor do aviso. "Perigo
+  // Potencial" tem de ser testado ANTES de "Perigo" (o substring engana).
+  const cor = String(aviso.aviso_cor || '').toLowerCase();
+  const sev = String(aviso.severidade || '').toLowerCase();
+  const s = `${sev} ${cor}`;
+  if (!s.trim()) return 'amarelo';
+  if (/(grande perigo|extreme|vermelho|\bred\b)/.test(s)) return 'vermelho';
+  if (/(perigo potencial|potencial|moderate|amarelo|\byellow\b|aten[cç][aã]o)/.test(s)) return 'amarelo';
+  if (/(perigo|severe|laranja|orange)/.test(s)) return 'laranja';
+  return 'amarelo'; // rótulo desconhecido: segue o mais brando, mas o texto original vai no card
+}
+
+// Ray casting: o ponto (lon/lat) está dentro do anel externo do polígono?
+function pontoNoAnel(lon, lat, anel) {
+  let dentro = false;
+  for (let i = 0, j = anel.length - 1; i < anel.length; j = i++) {
+    const xi = anel[i][0], yi = anel[i][1];
+    const xj = anel[j][0], yj = anel[j][1];
+    if (yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) dentro = !dentro;
+  }
+  return dentro;
+}
+
+function pontoNoPoligono(aviso) {
+  let g = aviso.poligono;
+  if (typeof g === 'string') {
+    try {
+      g = JSON.parse(g);
+    } catch {
+      return false;
+    }
+  }
+  if (!g || typeof g !== 'object') return false;
+  const polys =
+    g.type === 'MultiPolygon' ? g.coordinates : g.type === 'Polygon' ? [g.coordinates] : null;
+  if (!Array.isArray(polys)) return false;
+  for (const poly of polys) {
+    const anel = Array.isArray(poly?.[0]) ? poly[0] : null;
+    if (anel && anel.length > 2 && pontoNoAnel(CAMPO_BOM.lon, CAMPO_BOM.lat, anel)) return true;
+  }
+  return false;
+}
+
+// O aviso cobre Campo Bom? Ordem: lista explícita de geocodes → lista de
+// municípios ("Nome - UF (IBGE)", confiável inclusive no negativo) →
+// fallback geoespacial (polígono), só quando a lista não existe.
+function cobreCampoBom(aviso) {
+  const COD = CAMPO_BOM.codigoIbge;
+  if (typeof aviso.geocodes === 'string') {
+    if (aviso.geocodes.split(',').map((s) => s.trim()).includes(COD)) return true;
+  }
+  if (typeof aviso.municipios === 'string' && aviso.municipios.trim()) {
+    for (const parte of aviso.municipios.split(',')) {
+      const m = parte.match(/\((\d{7})\)\s*$/);
+      if (m && m[1] === COD) return true;
+      if (new RegExp(`^${CAMPO_BOM.nome} - ${CAMPO_BOM.uf}\\b`, 'i').test(parte.trim())) return true;
+    }
+    return false; // a lista existe e a cidade não está nela
+  }
+  return pontoNoPoligono(aviso);
+}
+
+// data_inicio vem como "2026-09-21T00:00:00.000Z" (data local, relógio
+// zerado) e hora_inicio como "09:03" (horário local de Brasília, UTC-3,
+// sem horário de verão desde 2019). Compomos o wall-clock local num epoch.
+function inmetEpoch(dataStr, horaStr) {
+  const d = String(dataStr || '').slice(0, 10);
+  const [y, mo, dia] = d.split('-').map(Number);
+  const [hh, mm] = String(horaStr || '00:00').split(':').map(Number);
+  if (!y || !mo || !dia) return null;
+  const t = Date.UTC(y, mo - 1, dia, hh || 0, mm || 0) + 3 * 3600 * 1000;
+  return new Date(t).toISOString();
+}
+
+function parseInmetAviso(raw, periodo) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = raw.id != null ? String(raw.id) : raw.codigo != null ? String(raw.codigo) : null;
+  const descricao = String(raw.descricao || '').trim();
+  if (!id || !descricao) return null;
+  const inicio =
+    raw.inicio != null ? String(raw.inicio) : inmetEpoch(raw.data_inicio, raw.hora_inicio);
+  const fim =
+    raw.fim != null ? String(raw.fim) : inmetEpoch(raw.data_fim, raw.hora_fim);
+  const riscos = Array.isArray(raw.riscos)
+    ? raw.riscos.map((r) => String(r || '').trim()).filter(Boolean)
+    : [];
+  const instrucoes = Array.isArray(raw.instrucoes)
+    ? raw.instrucoes.map((r) => String(r || '').trim()).filter(Boolean)
+    : [];
+  return {
+    id,
+    // "Aviso de Chuvas Intensas" → "Chuvas Intensas"
+    tipo: descricao.replace(/^aviso\s+de\s+/i, '').replace(/\.$/, '').trim() || descricao,
+    severidade: normalizarSeveridade(raw),
+    severidadeOriginal: raw.severidade != null ? String(raw.severidade) : null,
+    periodo, // 'hoje' (vigente) | 'futuro' (publicado, inicia depois)
+    inicio: inicio || null,
+    fim: fim || null,
+    riscos,
+    instrucoes,
+  };
+}
+
+let inmetCache = { avisos: null, ts: 0 };
+
+async function buscarAvisosInmet() {
+  const now = Date.now();
+  if (inmetCache.avisos && now - inmetCache.ts < INMET_CACHE_TTL_MS) {
+    return { avisos: inmetCache.avisos, atualizadoEm: inmetCache.ts, fallback: false };
+  }
+  try {
+    const resp = await fetch(INMET_URL, {
+      signal: AbortSignal.timeout(INMET_TIMEOUT_MS),
+      headers: { Accept: 'application/json', 'User-Agent': 'CampoBomMonitor/1.0 (painel rio dos sinos)' },
+    });
+    if (!resp.ok) throw new Error(`INMET respondeu HTTP ${resp.status}`);
+    const payload = await resp.json();
+    if (!payload || typeof payload !== 'object') throw new Error('INMET retornou payload inválido');
+
+    const buckets = [
+      ['hoje', Array.isArray(payload.hoje) ? payload.hoje : []],
+      ['futuro', Array.isArray(payload.futuro) ? payload.futuro : []],
+    ];
+    // Revisões do mesmo aviso (id_aviso + id_sequencia): mantém a última.
+    const porAviso = new Map();
+    for (const [periodo, lista] of buckets) {
+      for (const raw of lista) {
+        if (!raw || typeof raw !== 'object') continue;
+        const key = String(raw.id_aviso ?? raw.id ?? raw.codigo ?? Math.random());
+        const seq = Number(raw.id_sequencia ?? 0);
+        const prev = porAviso.get(key);
+        if (!prev || seq >= Number(prev.id_sequencia ?? 0)) porAviso.set(key, { ...raw, __periodo: periodo });
+      }
+    }
+    const avisos = [];
+    for (const raw of porAviso.values()) {
+      if (!cobreCampoBom(raw)) continue;
+      const m = parseInmetAviso(raw, raw.__periodo);
+      if (m) avisos.push(m);
+    }
+    avisos.sort(
+      (a, b) =>
+        (SEVERIDADE_RANK[b.severidade] - SEVERIDADE_RANK[a.severidade]) ||
+        String(a.inicio || '').localeCompare(String(b.inicio || '')),
+    );
+    inmetCache = { avisos, ts: now };
+    return { avisos, atualizadoEm: now, fallback: false };
+  } catch (err) {
+    // INMET fora do ar: última lista válida (com fallback=true) ou vazia.
+    if (inmetCache.avisos) {
+      return { avisos: inmetCache.avisos, atualizadoEm: inmetCache.ts, fallback: true };
+    }
+    console.error(`[inmet] indisponível: ${err?.message || err}`);
+    return { avisos: [], atualizadoEm: null, fallback: true };
+  }
+}
 
 const DEFAULT_THRESHOLDS = [
   {
@@ -43,6 +244,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🟡 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Atenção ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nMantenha atenção e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
   },
   {
     id: 'alerta',
@@ -52,6 +256,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🟠 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Alerta ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nPrepare-se: identifique rotas de fuga e mantenha documentos acessíveis.\nDefesa Civil: (51) 3597-3683 · 199',
   },
   {
     id: 'inundacao',
@@ -61,6 +268,9 @@ const DEFAULT_THRESHOLDS = [
     builtin: true,
     message:
       '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
+    preWarningM: 0.3,
+    preWarningMessage:
+      '🔴 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Inundação ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nResidentes de áreas de risco: preparem-se para deixar a área. Não atravesse a margem.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
   },
 ];
 
@@ -89,7 +299,15 @@ function loadStore() {
     return {
       ...base,
       ...raw,
-      thresholds: Array.isArray(raw.thresholds) && raw.thresholds.length ? raw.thresholds : base.thresholds,
+      // garante os campos de pré-alerta (migração de stores antigos)
+      thresholds: (Array.isArray(raw.thresholds) && raw.thresholds.length ? raw.thresholds : base.thresholds).map((t) => {
+        const d = base.thresholds.find((x) => x.id === t.id);
+        return {
+          ...t,
+          preWarningM: t.preWarningM != null ? Number(t.preWarningM) || 0 : d ? d.preWarningM : 0,
+          preWarningMessage: t.preWarningMessage != null ? String(t.preWarningMessage) : d ? d.preWarningMessage : '',
+        };
+      }),
       subscribers: Array.isArray(raw.subscribers) ? raw.subscribers : [],
       fired: raw.fired && typeof raw.fired === 'object' ? raw.fired : {},
       log: Array.isArray(raw.log) ? raw.log.slice(-80) : [],
@@ -146,6 +364,9 @@ function ensureAdminSubscriber() {
 let store = loadStore();
 ensureAdminSubscriber();
 
+/** limite de taxa do POST /api/bot/reading (1 por 60 s, global) */
+let lastReadingPushAt = 0;
+
 /* ------------------------------------------------------------------ */
 /* Auth                                                                */
 /* ------------------------------------------------------------------ */
@@ -191,24 +412,33 @@ async function sendTelegram(chatId, text) {
   }
 }
 
-function interpolate(template, reading, threshold) {
+function interpolate(template, reading, threshold, preM = 0) {
   const hora = reading.ts
     ? new Date(reading.ts).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
     : new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   const nivel = Number(reading.level).toFixed(2).replace('.', ',');
   const cota = Number(threshold.meters).toFixed(2).replace('.', ',');
+  const pre = Number(threshold.meters - preM).toFixed(2).replace('.', ',');
   const vazao = reading.flow != null ? Number(reading.flow).toFixed(1).replace('.', ',') : '—';
   return String(template || '')
     .replaceAll('{nivel}', nivel)
     .replaceAll('{level}', nivel)
     .replaceAll('{cota}', cota)
+    .replaceAll('{pre}', pre)
     .replaceAll('{nome}', threshold.name)
     .replaceAll('{hora}', hora)
     .replaceAll('{vazao}', vazao);
 }
 
-async function dispatchThreshold(threshold, reading, reason) {
-  const text = interpolate(threshold.message, reading, threshold);
+async function dispatchThreshold(threshold, reading, reason, preM = 0) {
+  const isTest = reason === 'teste_manual';
+  // Teste vai marcado: o texto real do alerta não pode ser indistinguível
+  // de um teste — num evento real, um "teste" sem marca apaga a confiança
+  // dos inscritos no alerta.
+  const body = interpolate(threshold.message, reading, threshold, preM);
+  const text = isTest
+    ? `🧪 TESTE — não é um alerta real (mensagem do limite "${threshold.name}"${preM > 0 ? ' · pré-aviso' : ''}).\n\n${body}`
+    : body;
   const targets = store.subscribers.filter((s) => s.active !== false);
   const results = [];
 
@@ -283,6 +513,26 @@ async function evaluateReading(reading) {
 
   for (const t of enabled) {
     const above = reading.level + 1e-9 >= Number(t.meters);
+
+    // PRÉ-AVISO: dispara quando a leitura cruza (cota - pré-alerta),
+    // enquanto o nível ainda está ABAIXO da cota principal. Se a leitura
+    // pular direto para cima da cota, ganha o alerta principal (sem
+    // pré-aviso duplo). Recua a marca quando o nível desce, para poder
+    // avisar de novo se subir outra vez.
+    const preM = Number(t.preWarningM) > 0 ? Number(t.preWarningM) : 0;
+    if (preM > 0 && t.preWarningMessage && !above) {
+      const preLevel = Number(t.meters) - preM;
+      const preFired = store.fired[`${t.id}:pre`];
+      if (reading.level + 1e-9 >= preLevel && !preFired) {
+        store.fired[`${t.id}:pre`] = { ts: Date.now(), level: reading.level };
+        saveStore();
+        const entry = await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'pre_alerta', preM);
+        dispatched.push(entry);
+      } else if (reading.level < preLevel && preFired) {
+        delete store.fired[`${t.id}:pre`];
+      }
+    }
+
     if (above && !store.fired[t.id]) {
       store.fired[t.id] = { ts: Date.now(), level: reading.level };
       saveStore();
@@ -290,6 +540,7 @@ async function evaluateReading(reading) {
       dispatched.push(entry);
     } else if (!above && store.fired[t.id]) {
       delete store.fired[t.id];
+      delete store.fired[`${t.id}:pre`];
     }
   }
 
@@ -591,7 +842,9 @@ function publicConfig() {
     lastReading: store.lastReading,
     fired: store.fired,
     log: store.log.slice(0, 40),
-    telegramToken: TELEGRAM_BOT_TOKEN,
+    // Nunca expor o token por padrão: quem tem o token controla o bot.
+    // Só vai no payload quando TELEGRAM_BROWSER_BRIDGE=1 (fallback de emergência).
+    telegramToken: EXPOSE_BROWSER_BRIDGE ? TELEGRAM_BOT_TOKEN : undefined,
     outboxCount: Array.isArray(store.outbox) ? store.outbox.length : 0,
     subscribeLink: `https://t.me/${TELEGRAM_BOT_USERNAME}?start=alerta`,
   };
@@ -613,10 +866,72 @@ function normalizeThreshold(input, fallback = {}) {
   const meters = Number(String(input.meters ?? fallback.meters ?? '').toString().replace(',', '.'));
   const message = String(input.message ?? fallback.message ?? '').trim();
   const enabled = input.enabled == null ? fallback.enabled !== false : !!input.enabled;
+  // pré-alerta: distância (m) ANTES da cota; 0 = desativado
+  const rawPre = input.preWarningM === '' || input.preWarningM == null ? fallback.preWarningM : input.preWarningM;
+  const preWarningM = Number(String(rawPre ?? 0).replace(',', '.'));
+  const preWarningMessage =
+    input.preWarningMessage == null
+      ? String(fallback.preWarningMessage ?? '')
+      : String(input.preWarningMessage).trim();
   if (!name) throw new Error('informe o nome do limite');
   if (!Number.isFinite(meters) || meters <= 0 || meters > 30) throw new Error('cota inválida (metros)');
   if (!message) throw new Error('informe a mensagem do alerta');
-  return { name, meters: +meters.toFixed(2), message, enabled };
+  if (!Number.isFinite(preWarningM) || preWarningM < 0 || preWarningM > 5) {
+    throw new Error('pré-alerta inválido (use 0 a 5 m antes da cota; 0 desativa)');
+  }
+  return { name, meters: +meters.toFixed(2), message, enabled, preWarningM: +preWarningM.toFixed(2), preWarningMessage };
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+/**
+ * Serve o build estático de DIST_DIR.
+ *  - bloqueia path traversal (só arquivos DENTRO de DIST_DIR);
+ *  - rota sem arquivo correspondente cai no index.html (SPA);
+ *  - retorna true quando atendeu, false para 404.
+ */
+function serveStatic(req, res, pathname) {
+  if (!existsSync(DIST_DIR)) return false;
+  let name;
+  try {
+    name = decodeURIComponent(pathname || '/');
+  } catch {
+    return false;
+  }
+  const file = resolve(DIST_DIR, name.replace(/^\/+/, ''));
+  if (file !== DIST_DIR && !file.startsWith(DIST_DIR + sep)) return false;
+
+  let target = file;
+  if (!existsSync(target) || statSync(target).isDirectory()) {
+    const index = join(DIST_DIR, 'index.html');
+    if (req.method === 'GET' && existsSync(index)) target = index;
+    else return false;
+  }
+
+  const body = readFileSync(target);
+  const isIndex = target === join(DIST_DIR, 'index.html');
+  res.writeHead(200, {
+    'Content-Type': MIME[extname(target).toLowerCase()] || 'application/octet-stream',
+    'Content-Length': body.length,
+    // index.html sempre fresco (deploy novo); assets podem ficar em cache
+    'Cache-Control': isIndex ? 'no-store' : 'public, max-age=3600',
+  });
+  res.end(req.method === 'HEAD' ? undefined : body);
+  return true;
 }
 
 const server = createServer(async (req, res) => {
@@ -644,12 +959,47 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Avisos meteorológicos do INMET para Campo Bom — PÚBLICO (o site é
+    // aberto) e protegido por cache/TTL + timeout na busca upstream.
+    if (req.method === 'GET' && path === '/api/alertas/campo-bom') {
+      const r = await buscarAvisosInmet();
+      send(res, 200, {
+        ok: true,
+        municipio: `${CAMPO_BOM.nome} - ${CAMPO_BOM.uf} (${CAMPO_BOM.codigoIbge})`,
+        fonte: 'INMET — Instituto Nacional de Meteorologia',
+        atualizadoEm: r.atualizadoEm,
+        fallback: r.fallback,
+        avisos: r.avisos,
+      });
+      return;
+    }
+
     if (req.method === 'POST' && path === '/api/telegram/webhook') {
+      // secret_token (Telegram só envia updates para um webhook configurado
+      // com o mesmo segredo) — evita que qualquer pessoa que saiba da URL
+      // injete "updates" falsos (spam para chats arbitrários + poluição da
+      // lista de inscritos). Só exigido quando o bridge do navegador está
+      // desligado — o bridge registra o webhook sem segredo.
+      const expectedSecret = (() => {
+        try {
+          return new URL(TELEGRAM_WEBHOOK_URL).searchParams.get('secret_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+      if (!EXPOSE_BROWSER_BRIDGE && expectedSecret && url.searchParams.get('secret_token') !== expectedSecret) {
+        send(res, 403, { ok: false, error: 'secret_token inválido' });
+        return;
+      }
       const body = await readBody(req);
+      // update bem-formado: update_id inteiro crescente (o Telegram é a
+      // única fonte legítima de updates válidos)
+      if (!Number.isInteger(body?.update_id) || body.update_id <= 0) {
+        send(res, 400, { ok: false, error: 'update inválido' });
+        return;
+      }
       const reply = commandReply(body);
-      store.bot.ok = true;
-      store.bot.lastError = null;
-      saveStore();
+      // não marcamos bot.ok aqui: o status real vem do polling/verifyBot
       if (reply) {
         send(res, 200, {
           method: 'sendMessage',
@@ -673,10 +1023,28 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    /* leitura pública: o painel (e a rotina ANA) enviam o nível atual */
+    /* leitura pública: o painel envia o nível atual para o bot avaliar.
+     * Endpoint sem autenticação (o painel público é anônimo), então aplica
+     * limite de taxa e sanidade: sem isso qualquer um poderia disparar
+     * alertas de enchente falsos para todos os inscritos. */
     if (req.method === 'POST' && path === '/api/bot/reading') {
       const body = await readBody(req);
       const level = Number(String(body.level ?? '').toString().replace(',', '.'));
+      const nowMs = Date.now();
+      if (nowMs - lastReadingPushAt < 60000) {
+        send(res, 429, { ok: false, error: 'envio frequente demais — aguarde 60 s' });
+        return;
+      }
+      if (!Number.isFinite(level) || level < 0.5 || level > 12) {
+        send(res, 400, { ok: false, error: 'nível fora da faixa plausível (0,5–12 m)' });
+        return;
+      }
+      const last = store.lastReading;
+      if (last && Number.isFinite(last.level) && Math.abs(level - last.level) > 2.0) {
+        send(res, 400, { ok: false, error: 'salto de nível improvável (±2 m) — leitura ignorada' });
+        return;
+      }
+      lastReadingPushAt = nowMs;
       const result = await evaluateReading({
         level,
         ts: body.ts || Date.now(),
@@ -766,11 +1134,23 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && path === '/api/bot/test') {
       const body = await readBody(req);
-      const id = body.thresholdId;
-      const t = store.thresholds.find((x) => x.id === id) || store.thresholds[0];
-      if (!t) throw new Error('nenhum limite cadastrado');
+      // SEM fallback para o primeiro limite: ID inválido significa erro do
+      // cliente, e testar o limite errado ensaia a mensagem errada.
+      const t = store.thresholds.find((x) => x.id === body.thresholdId);
+      if (!t) {
+        send(res, 404, { ok: false, error: 'limite não encontrado' });
+        return;
+      }
+      const preTest = body.pre === true;
+      const preM = preTest && Number(t.preWarningM) > 0 ? Number(t.preWarningM) : 0;
+      if (preTest && (preM <= 0 || !t.preWarningMessage)) {
+        send(res, 400, { ok: false, error: 'este limite não tem pré-alerta configurado (distância e mensagem)' });
+        return;
+      }
       const reading = store.lastReading || { level: t.meters, ts: Date.now(), flow: null };
-      const entry = await dispatchThreshold(t, reading, 'teste_manual');
+      const entry = preTest
+        ? await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'teste_manual', preM)
+        : await dispatchThreshold(t, reading, 'teste_manual');
       send(res, 200, { ok: true, entry, ...publicConfig() });
       return;
     }
