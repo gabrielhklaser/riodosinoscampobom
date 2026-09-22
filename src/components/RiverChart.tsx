@@ -110,11 +110,13 @@ function RiverChart({ data, spanHours, showRain, rainStations }: Props) {
           dy={6}
         />
 
+        {/* escala em metros na mesma cor da curva do nível (azul claro em
+            condição normal; acompanha a cor do status quando o rio sobe) */}
         <YAxis
           yAxisId="level"
           domain={[yMin, yMax]}
           tickFormatter={(v: number) => `${v.toFixed(1)}m`}
-          tick={{ fill: '#64748b', fontSize: 11 }}
+          tick={{ fill: color, fontSize: 11, fontWeight: 600 }}
           axisLine={false}
           tickLine={false}
           width={58}

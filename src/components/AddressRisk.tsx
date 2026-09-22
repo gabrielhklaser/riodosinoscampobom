@@ -132,11 +132,11 @@ export default function AddressRisk({ flood, level, onSelect, selected, onShowAl
 
           <div className="min-w-0 flex-1">
             <p className="text-sm font-bold text-slate-100">
-              Consulte um endereço para saber se você se encontra em área de risco de alagamentos
+              Consulte um endereço para saber se você se encontra em área de risco de alagamentos,
+              segundo a mancha da última grande enchente de 2024.
             </p>
             <p className="mt-0.5 text-xs text-slate-400">
-              Digite rua e número (ou CEP) para verificar se o local está dentro da mancha da grande
-              inundação de 2024.
+              Digite rua e número (ou CEP) para verificar a classificação de risco do local.
             </p>
 
             <div ref={boxRef} className="relative mt-3 max-w-xl">
