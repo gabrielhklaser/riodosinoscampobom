@@ -9,7 +9,7 @@
  *  ✓ Reservatório de escoamento de base (Kbas)
  *  ✓ Condição de contorno a jusante: nível do Guaíba (estação 87450020)
  *  ✓ Efeito de remanso empírico calibrado no evento de 2024
- *  ✓ NSE no backtest
+ *  ✓ NSE no backtest + linha de base de persistência (controle de habilidade)
  *  ✓ Hidrógrafo triangular com lag variável por sub-bacia
  *
  * Correções (revisão do sysadmin, 09/2026):
@@ -143,10 +143,15 @@ export interface BacktestResult {
   pairs: { hour: number; predicted: number; observed: number; errorM: number }[];
   mae: number;
   rmse: number;
-  nse: number;
+  /** null quando o nível observado é constante na janela (NSE indefinido) */
+  nse: number | null;
   accuracy: number;
   tolerance: number;
   n: number;
+  /** MAE da linha de base de persistência ("o nível fica onde está"), mesmas origens */
+  persistMae: number | null;
+  /** redução de MAE vs. persistência, em %; > 0 = modelo agrega habilidade */
+  skillVsPersist: number | null;
 }
 
 export interface IphOutput {
@@ -467,12 +472,28 @@ async function fetchRainPack(now: number): Promise<RainPack> {
 
 
 
-async function fetchPastModelRain(model: string, pastDays: number): Promise<number[]> {
+/** Chuva analisada (passado) de um modelo, com carimbo de hora — usada no
+ *  backtest. O carimbo evita o erro de alinhamento por índice (o antigo
+ *  `pastRain.length + offset` tratava o fim do array como "agora", com
+ *  off-by-one de 1 h). */
+export interface RainHistory {
+  ts: number;
+  mm: number;
+}
+
+async function fetchPastModelRain(model: string, pastDays: number): Promise<RainHistory[]> {
   try {
     const j = await fetchJson(
       `https://api.open-meteo.com/v1/forecast?latitude=-29.6917&longitude=-51.0461&hourly=precipitation&models=${model}&past_days=${pastDays}&forecast_days=0&timezone=America%2FSao_Paulo`
     );
-    return ((j?.hourly?.precipitation as number[]) ?? []).map((v) => Number(v) || 0);
+    const times = (j?.hourly?.time as string[]) ?? [];
+    const vals = (j?.hourly?.precipitation as number[]) ?? [];
+    const out: RainHistory[] = [];
+    for (let i = 0; i < times.length; i++) {
+      const ts = parseOmHour(times[i]);
+      if (Number.isFinite(ts)) out.push({ ts, mm: Number(vals[i]) || 0 });
+    }
+    return out;
   } catch { return []; }
 }
 
@@ -599,11 +620,30 @@ function remanso(guaibaLevel: number | null): number {
 /* ================================================================== */
 /* Backtest com NSE                                                    */
 /* ================================================================== */
+/* Revisão metodológica (09/2026):
+ *  ✓ Fim do viés de look-ahead: o fatiador antigo ancorava a origem no
+ *    índice 0, mas propagateCurve lê a chuva em RAIN_PAST_H + t − lag
+ *    (espera a origem no índice RAIN_PAST_H). O backtest consumia chuva
+ *    de ~48 h DEPOIS da previsão simulada — validação inflada. Agora a
+ *    fatia é montada por carimbo de hora, com índice RAIN_PAST_H == tOrigin.
+ *  ✓ Linha de base de persistência ("o nível fica onde está"): controle
+ *    mínimo de qualquer previsão hidrológica de curto prazo — o modelo só
+ *    demonstra habilidade se bater essa referência (skillVsPersist).
+ *  ✓ Origens a cada 3 h (antes: 1 h) — janelas sobrepostas de hora em hora
+ *    geram amostras fortemente autocorrelacionadas e inflam o n.
+ *  ✓ NSE = null quando o nível observado é constante na janela (ssTot = 0):
+ *    nesse caso o NSE é INDEFINIDO, não zero.
+ *  Mantida (documentada) a aproximação de usar API/Guaíba atuais para as
+ *  origens históricas — reconstruir o API de cada época exigiria série de
+ *  chuva mais longa que a janela de 4 dias da análise.
+ */
+const BACKTEST_SPAN_H = 72; // origens de −72 h até −horizonte
+const BACKTEST_STEP_H = 3; // passo entre origens (h)
 
-function runBacktest(
+export function runBacktest(
   campoBom: { ts: number; h: number }[],
-  pastEcmwf: number[],
-  pastGfs: number[],
+  pastEcmwf: RainHistory[],
+  pastGfs: RainHistory[],
   now: number,
   meanApi: number,
   guaiba: number | null,
@@ -616,9 +656,14 @@ function runBacktest(
 
   for (const model of ['ecmwf', 'gfs'] as const) {
     const pastRain = model === 'ecmwf' ? pastEcmwf : pastGfs;
-    const pairs: BacktestResult['pairs'] = [];
+    // chuva analisada indexada pela hora fechada
+    const rainByHour = new Map<number, number>();
+    for (const r of pastRain) rainByHour.set(Math.floor(r.ts / 3600000) * 3600000, r.mm);
 
-    for (let offset = -72; offset <= -horizonH; offset += 1) {
+    const pairs: BacktestResult['pairs'] = [];
+    const persistErrs: number[] = [];
+
+    for (let offset = -BACKTEST_SPAN_H; offset <= -horizonH; offset += BACKTEST_STEP_H) {
       const tOrigin = now + offset * 3600000;
       const tTarget = tOrigin + horizonH * 3600000;
       const hOrigin = levelAt(campoBom, tOrigin);
@@ -628,20 +673,27 @@ function runBacktest(
       // Aproximação do backtest: usa a taxa local de 2 h (sem a mistura com
       // Taquara) e o API/Guaíba atuais para todas as origens históricas.
       const rate = dH(campoBom, tOrigin, 2);
-      const originIdx = pastRain.length + Math.round(offset);
-      const rainSlice: number[] = [];
-      for (let h = 0; h < horizonH + 24; h++) {
-        const idx = originIdx + h;
-        rainSlice.push(idx >= 0 && idx < pastRain.length ? pastRain[idx] : 0);
+
+      // fatia alinhada: índice RAIN_PAST_H == tOrigin; o motor lê a chuva
+      // em RAIN_PAST_H + t − lag (t = 1..horizonte), ou seja, só usa chuva
+      // da janela [tOrigin − lag_max, tOrigin + horizonte] — sem futuro.
+      const tOriginHour = Math.floor(tOrigin / 3600000) * 3600000;
+      const rainSlice: number[] = new Array(RAIN_PAST_H + horizonH + 1).fill(0);
+      for (let k = 0; k < rainSlice.length; k++) {
+        rainSlice[k] = rainByHour.get(tOriginHour + (k - RAIN_PAST_H) * 3600000) ?? 0;
       }
 
       const prop = propagateCurve(hOrigin, horizonH, rate, rate, rainSlice, meanApi, guaiba);
       const predicted = prop.stages[horizonH] ?? hOrigin;
       pairs.push({ hour: offset, predicted, observed: hTarget, errorM: +(predicted - hTarget).toFixed(3) });
+      persistErrs.push(Math.abs(hOrigin - hTarget));
     }
 
     if (!pairs.length) {
-      results.push({ horizon: horizonH, model, pairs: [], mae: 0, rmse: 0, nse: 0, accuracy: 0, tolerance: toleranceM, n: 0 });
+      results.push({
+        horizon: horizonH, model, pairs: [], mae: 0, rmse: 0, nse: null,
+        accuracy: 0, tolerance: toleranceM, n: 0, persistMae: null, skillVsPersist: null,
+      });
       continue;
     }
 
@@ -651,13 +703,17 @@ function runBacktest(
     const hits = pairs.filter((p) => Math.abs(p.errorM) <= toleranceM).length;
     const accuracy = +((hits / n) * 100).toFixed(1);
 
-    // Nash-Sutcliffe
+    // Nash-Sutcliffe — indefinido (null) se o observado é constante na janela
     const obsMean = pairs.reduce((s, p) => s + p.observed, 0) / n;
     const ssRes = pairs.reduce((s, p) => s + (p.observed - p.predicted) ** 2, 0);
     const ssTot = pairs.reduce((s, p) => s + (p.observed - obsMean) ** 2, 0);
-    const nse = ssTot > 0 ? +(1 - ssRes / ssTot).toFixed(3) : 0;
+    const nse = ssTot > 1e-9 ? +(1 - ssRes / ssTot).toFixed(3) : null;
 
-    results.push({ horizon: horizonH, model, pairs, mae, rmse, nse, accuracy, tolerance: toleranceM, n });
+    // linha de base de persistência: previsão ingênua "nível não muda"
+    const persistMae = +(persistErrs.reduce((s, v) => s + v, 0) / n).toFixed(3);
+    const skillVsPersist = persistMae > 1e-6 ? +((1 - mae / persistMae) * 100).toFixed(1) : null;
+
+    results.push({ horizon: horizonH, model, pairs, mae, rmse, nse, accuracy, tolerance: toleranceM, n, persistMae, skillVsPersist });
   }
   return results;
 }
@@ -840,7 +896,11 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
       ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 12, 0.25, idwW),
       ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 24, 0.40, idwW),
     ];
-  } catch { /* backtest falhou */ }
+  } catch (err) {
+    // degradação graciosa COM diagnóstico (o painel segue sem o quadro de
+    // validação; o console diz o motivo exato)
+    console.warn('[iph] validação retrospectiva indisponível:', err instanceof Error ? err.message : err);
+  }
 
   return output;
 }

@@ -360,26 +360,33 @@ export default function IphForecast({ readings }: Props) {
           {out.backtest.length > 0 && (
             <div className="mb-5 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
               <p className="mb-3 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-400">
-                <Activity className="h-3.5 w-3.5 text-teal-400" /> Validação retrospectiva — últimas 24 h
+                <Activity className="h-3.5 w-3.5 text-teal-400" /> Validação retrospectiva — últimas 72 h
               </p>
-              <p className="mb-3 text-[11px] text-slate-500">
-                Para cada instante das últimas 24 h, o motor simulou a previsão que teria sido feita e
-                comparou com o nível realmente observado pela ANA. O <strong className="text-slate-300">% de
-                acerto</strong> indica a fração de previsões que ficaram dentro da tolerância.
+              <p className="mb-3 text-[11px] leading-relaxed text-slate-500">
+                O motor simulou as previsões que teria emitido a cada 3 h nas últimas 72 h — usando
+                apenas os dados disponíveis em cada origem (chuva analisada alinhada ao instante da
+                previsão, sem consultar o futuro) — e comparou com o nível realmente observado pela
+                ANA. O <strong className="text-slate-300">% de acerto</strong> indica a fração de
+                previsões dentro da tolerância. A <strong className="text-slate-300">persistência</strong>{' '}
+                ("o nível fica onde está") é a linha de base de controle: o modelo só demonstra
+                habilidade quando o MAE fica abaixo dela.
               </p>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {out.backtest.map((bt) => {
                   const good = bt.accuracy >= 70;
                   const ok = bt.accuracy >= 40;
+                  const semDados = bt.n === 0;
                   return (
                     <div
                       key={`${bt.model}-${bt.horizon}`}
                       className={`rounded-lg border p-3 ${
-                        good
-                          ? 'border-emerald-500/30 bg-emerald-500/5'
-                          : ok
-                            ? 'border-amber-500/30 bg-amber-500/5'
-                            : 'border-red-500/30 bg-red-500/5'
+                        semDados
+                          ? 'border-slate-800 bg-slate-900/40'
+                          : good
+                            ? 'border-emerald-500/30 bg-emerald-500/5'
+                            : ok
+                              ? 'border-amber-500/30 bg-amber-500/5'
+                              : 'border-red-500/30 bg-red-500/5'
                       }`}
                     >
                       <div className="flex items-center justify-between">
@@ -388,27 +395,81 @@ export default function IphForecast({ readings }: Props) {
                         </span>
                         <span
                           className={`text-lg font-bold tabular-nums ${
-                            good ? 'text-emerald-300' : ok ? 'text-amber-300' : 'text-red-300'
+                            semDados
+                              ? 'text-slate-500'
+                              : good
+                                ? 'text-emerald-300'
+                                : ok
+                                  ? 'text-amber-300'
+                                  : 'text-red-300'
                           }`}
                         >
-                          {bt.accuracy.toFixed(0)}%
+                          {semDados ? '—' : `${bt.accuracy.toFixed(0)}%`}
                         </span>
                       </div>
-                      <div className="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-slate-800">
-                        <div
-                          className={`h-full rounded-full transition-all ${
-                            good ? 'bg-emerald-500' : ok ? 'bg-amber-500' : 'bg-red-500'
-                          }`}
-                          style={{ width: `${Math.min(100, bt.accuracy)}%` }}
-                        />
-                      </div>
-                      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-500">
-                        <span>MAE: <strong className="text-slate-300">{n2(bt.mae)} m</strong></span>
-                        <span>RMSE: <strong className="text-slate-300">{n2(bt.rmse)} m</strong></span>
-                        <span>NSE: <strong className={bt.nse >= 0.7 ? 'text-emerald-300' : bt.nse >= 0.4 ? 'text-amber-300' : 'text-red-300'}>{bt.nse.toFixed(2)}</strong></span>
-                        <span>±{n2(bt.tolerance)} m</span>
-                        <span>{bt.n} pts</span>
-                      </div>
+                      {semDados ? (
+                        <p className="mt-2 text-[10px] text-slate-500">
+                          Sem dados suficientes na janela (série observada ou chuva analisada indisponível).
+                        </p>
+                      ) : (
+                        <>
+                          <div className="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className={`h-full rounded-full transition-all ${
+                                good ? 'bg-emerald-500' : ok ? 'bg-amber-500' : 'bg-red-500'
+                              }`}
+                              style={{ width: `${Math.min(100, bt.accuracy)}%` }}
+                            />
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-500">
+                            <span>MAE: <strong className="text-slate-300">{n2(bt.mae)} m</strong></span>
+                            <span>RMSE: <strong className="text-slate-300">{n2(bt.rmse)} m</strong></span>
+                            <span>
+                              NSE:{' '}
+                              <strong
+                                className={
+                                  bt.nse == null
+                                    ? 'text-slate-400'
+                                    : bt.nse >= 0.7
+                                      ? 'text-emerald-300'
+                                      : bt.nse >= 0.4
+                                        ? 'text-amber-300'
+                                        : 'text-red-300'
+                                }
+                              >
+                                {bt.nse == null ? 'n/d' : bt.nse.toFixed(2)}
+                              </strong>
+                            </span>
+                            <span>±{n2(bt.tolerance)} m</span>
+                            <span>{bt.n} pts</span>
+                          </div>
+                          <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-800/60 pt-1.5 text-[10px] text-slate-500">
+                            <span>
+                              Persistência (MAE):{' '}
+                              <strong className="text-slate-300">
+                                {bt.persistMae != null ? `${n2(bt.persistMae)} m` : '—'}
+                              </strong>
+                            </span>
+                            {bt.skillVsPersist != null && (
+                              <span>
+                                Habilidade vs. persistência:{' '}
+                                <strong
+                                  className={
+                                    bt.skillVsPersist > 0
+                                      ? 'text-emerald-300'
+                                      : bt.skillVsPersist === 0
+                                        ? 'text-amber-300'
+                                        : 'text-red-300'
+                                  }
+                                >
+                                  {bt.skillVsPersist > 0 ? '+' : ''}
+                                  {n1(bt.skillVsPersist)}%
+                                </strong>
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      )}
                     </div>
                   );
                 })}
@@ -474,7 +535,9 @@ export default function IphForecast({ readings }: Props) {
             Interpolação IDW. API diário (γ=0,87) com saturação diferenciada.
             Condição de contorno: nível do Guaíba (87450020, remanso k=0,15 acima de 1,50 m).
             Recessão: decaimento exponencial para H_base = 2,00 m (K = 0,004 h⁻¹).
-            Validação: MAE, RMSE e <strong className="text-emerald-300">Nash-Sutcliffe (NSE)</strong>.
+            Validação: MAE, RMSE, <strong className="text-emerald-300">Nash-Sutcliffe (NSE)</strong> e
+            linha de base de persistência (origens a cada 3 h nas últimas 72 h, chuva analisada
+            alinhada à origem — sem look-ahead).
             Estações: {IPH_STATIONS.map((s) => s.name).join(', ')}.
           </p>
         </>
