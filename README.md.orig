@@ -4,18 +4,11 @@ Painel de monitoramento do Rio dos Sinos em Campo Bom/RS e bot Telegram **[@defe
 
 Um único processo Node serve o site, lê a telemetria da ANA e mantém o bot **online** (long poll / webhook). Enquanto `npm start` estiver rodando num servidor com saída HTTPS, o `/start` responde e os alertas de cota são disparados.
 
-## Como os agentes se inscrevem
+## Como as pessoas se inscrevem
 
-Os avisos do bot são **somente para agentes públicos autorizados**
-(agentes da Defesa Civil / órgãos municipais com acesso ao painel técnico)
-— o site público não expõe mais o botão de inscrição.
-
-Dois caminhos:
-
-1. **Painel técnico** → aba *Configurações do Bot* → *Destinatários*:
-   adicionar o chat ID do agente (com nome).
-2. **Chat com o bot**: o agente inicia o chat com
-   `@defesacivilcampobom_bot` e usa `/start`.
+1. Abrir https://t.me/defesacivilcampobom_bot?start=alerta
+2. Tocar em **Iniciar**
+3. Pronto — passam a receber os avisos
 
 Comandos no chat: `/start` · `/stop` · `/nivel` · `/ajuda`
 

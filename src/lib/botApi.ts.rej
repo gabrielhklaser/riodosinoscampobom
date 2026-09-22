@@ -1,0 +1,27 @@
+--- src/lib/botApi.ts
++++ src/lib/botApi.ts
+@@ -8,6 +8,10 @@ export interface BotThreshold {
+   message: string;
+   enabled: boolean;
+   builtin?: boolean;
++  /** distância (m) ANTES da cota que dispara o pré-aviso; 0 = desativado */
++  preWarningM?: number;
++  /** mensagem do pré-aviso (mesmos placeholders; {pre} = cota do pré-aviso) */
++  preWarningMessage?: string;
+ }
+ 
+ export interface BotSubscriber {
+@@ -119,10 +123,10 @@ export function deleteThreshold(id: string) {
+   });
+ }
+ 
+-export function testThreshold(thresholdId: string) {
+-  return request<BotConfig & { ok: boolean }>('/api/bot/test', {
++export function testThreshold(thresholdId: string, pre = false) {
++  return request<BotConfig & { ok: boolean; entry: BotLogEntry }>('/api/bot/test', {
+     method: 'POST',
+-    body: JSON.stringify({ thresholdId }),
++    body: JSON.stringify({ thresholdId, pre }),
+   });
+ }
+ 
