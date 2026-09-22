@@ -42,6 +42,8 @@ O painel e a API sobem na porta `PORT` (padrão **3001**). O bot autentica em `@
 | `ADMIN_USER` / `ADMIN_PASSWORD` | **Obrigatória a senha.** Login do painel técnico (o servidor não inicia sem ela) |
 | `PORT` | Porta HTTP (hosts como Render/Railway injetam sozinhos) |
 | `TELEGRAM_WEBHOOK_URL` | Opcional. Se o site tiver HTTPS público, use `https://SEU-DOMINIO/api/telegram/webhook?secret_token=um-segredo-aleatorio` — o `secret_token` faz o servidor validar a origem do webhook |
+| `ADMIN_TOKEN_TTL_HOURS` | Opcional. Validade do token de sessão do painel técnico (padrão: 24 h) |
+| `LOGIN_MAX_FAILS` / `LOGIN_LOCK_MS` | Opcional. Anti-força-bruta: tentativas erradas antes de bloquear o IP (padrão: 8) e duração do bloqueio em ms (padrão: 15 min) |
 | `INMET_API_URL` | Opcional (testes/staging). Padrão: `https://apiprevmet3.inmet.gov.br/avisos/ativos` |
 | `INMET_CACHE_TTL_MS` | Opcional. TTL do cache dos avisos INMET, em ms (padrão: 720000 = 12 min) |
 
@@ -58,16 +60,27 @@ nunca quebra.
 ### ⚠️ Credenciais (leia antes de subir)
 
 - O repositório já foi publicado com o token antigo do bot e a senha antiga do
-  painel em texto plano. **Considere ambos vazados:**
+  painel em texto plano (inclusive em artefatos de merge `.orig`/`.rej`, já
+  removidos, e num check de senha hardcoded no front-end, já eliminado).
+  **Considere as credenciais antigas vazadas:**
   1. No BotFather, envie `/revoke` para `@defesacivilcampobom_bot` e copie o token novo;
-  2. Escolha uma nova senha forte para `ADMIN_PASSWORD`.
+  2. Use uma senha forte e exclusiva para `ADMIN_PASSWORD` (ela vive só nas
+     variáveis de ambiente do Render/VPS — nunca no git).
+- As credenciais antigas continuam no **histórico** do GitHub. Se quiser
+  eliminá-las de lá, é preciso reescrever o histórico (`git filter-repo`/BFG)
+  — mas o essencial é que token e senha antigos estejam **revogados/trocados**.
 - O servidor **recusa iniciar** sem `TELEGRAM_BOT_TOKEN` e `ADMIN_PASSWORD` no `.env`
   (mensagem de log diz exatamente o que falta).
+- Nenhuma senha existe no front-end: o login é validado **somente** no
+  servidor (`POST /api/auth/login`), que devolve um token HMAC com expiração
+  (`ADMIN_TOKEN_TTL_HOURS`, padrão 24 h). Tentativas erradas em sequência
+  bloqueiam o IP por 15 min (anti-força-bruta) e a comparação de senha/token
+  é em tempo constante (anti-timing-attack).
 - O token do bot **não é mais enviado** ao navegador em `/api/bot/config`.
   Só volta a ser exposto (para administradores) se você definir
   `TELEGRAM_BROWSER_BRIDGE=1` — fallback de emergência; mantenha desligado em produção.
-- Rollback dessas mudanças: `git revert` do commit — mas o token antigo
-  continuaria válido enquanto não for revogado no BotFather.
+- Ao trocar `ADMIN_PASSWORD`, todos os tokens de sessão antigos deixam de
+  valer imediatamente (a assinatura deriva da senha).
 
 ### systemd (VPS)
 

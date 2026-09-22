@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 loadEnv(join(__dirname, '..', '.env'));
@@ -370,16 +371,99 @@ let lastReadingPushAt = 0;
 /* ------------------------------------------------------------------ */
 /* Auth                                                                */
 /* ------------------------------------------------------------------ */
+/* Token de admin: HMAC-SHA256 assinado com a ADMIN_PASSWORD (que nunca
+ * sai do servidor) + data de expiração. Substitui o esquema antigo
+ * (base64 determinístico da senha, sem validade): agora o token expira
+ * sozinho e não permite reconstruir a senha a partir dele.
+ * ADMIN_TOKEN_TTL_HOURS controla a validade (padrão 24 h). */
+const ADMIN_TOKEN_TTL_MS =
+  Math.max(1, Number(process.env.ADMIN_TOKEN_TTL_HOURS || 24)) * 3600 * 1000;
+const TOKEN_PEPPER = 'defesacivil-campobom:v2';
 
-function adminToken() {
-  return Buffer.from(`admin:${ADMIN_PASSWORD}:defesacivil-campobom`).toString('base64url');
+function signTokenPayload(payload) {
+  return createHmac('sha256', ADMIN_PASSWORD).update(`${TOKEN_PEPPER}:${payload}`).digest('base64url');
+}
+
+function issueAdminToken() {
+  const exp = Date.now() + ADMIN_TOKEN_TTL_MS;
+  const payload = `admin.${exp}.${randomBytes(8).toString('hex')}`;
+  return { token: `${payload}.${signTokenPayload(payload)}`, expiresAt: exp };
+}
+
+function verifyAdminToken(token) {
+  if (typeof token !== 'string' || !token) return false;
+  const parts = token.split('.');
+  if (parts.length !== 4) return false;
+  const [role, expRaw, , sig] = parts;
+  const payload = parts.slice(0, 3).join('.');
+  if (role !== 'admin') return false;
+  const exp = Number(expRaw);
+  if (!Number.isFinite(exp) || exp <= Date.now()) return false;
+  return safeEqualStr(sig, signTokenPayload(payload));
+}
+
+/** Comparação em tempo constante (evita timing attack em senha/token). */
+function safeEqualStr(a, b) {
+  const ba = Buffer.from(String(a ?? ''));
+  const bb = Buffer.from(String(b ?? ''));
+  if (ba.length !== bb.length) return false;
+  return timingSafeEqual(ba, bb);
 }
 
 function isAuthorized(req) {
   const header = req.headers.authorization || '';
   const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  return bearer === adminToken();
+  return verifyAdminToken(bearer);
 }
+
+/* Bloqueio anti-força-bruta no login: após LOGIN_MAX_FAILS tentativas
+ * erradas, o IP fica bloqueado por LOGIN_LOCK_MS. Sem isso, a senha do
+ * painel poderia ser atacada por dicionário indefinidamente. */
+const LOGIN_MAX_FAILS = Number(process.env.LOGIN_MAX_FAILS || 8);
+const LOGIN_LOCK_MS = Number(process.env.LOGIN_LOCK_MS || 15 * 60 * 1000);
+const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
+/** @type {Map<string, { fails: number; firstFail: number; lockedUntil: number }>} */
+const loginAttempts = new Map();
+
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || req.socket?.remoteAddress || 'desconhecido';
+}
+
+function loginBlocked(ip) {
+  const rec = loginAttempts.get(ip);
+  if (!rec) return 0;
+  if (rec.lockedUntil > Date.now()) return rec.lockedUntil - Date.now();
+  if (Date.now() - rec.firstFail > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
+  return 0;
+}
+
+function registerLoginFailure(ip) {
+  const now = Date.now();
+  const rec = loginAttempts.get(ip);
+  if (!rec || now - rec.firstFail > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { fails: 1, firstFail: now, lockedUntil: 0 });
+    return;
+  }
+  rec.fails += 1;
+  if (rec.fails >= LOGIN_MAX_FAILS) {
+    rec.lockedUntil = now + LOGIN_LOCK_MS;
+    rec.fails = 0;
+    rec.firstFail = now;
+  }
+}
+
+function clearLoginFailures(ip) {
+  loginAttempts.delete(ip);
+}
+
+// faxina periódica do mapa de tentativas (evita crescimento sem limite)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of loginAttempts) {
+    if (rec.lockedUntil <= now && now - rec.firstFail > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
+  }
+}, 60 * 1000).unref?.();
 
 /* ------------------------------------------------------------------ */
 /* Telegram                                                            */
@@ -1014,10 +1098,32 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && path === '/api/auth/login') {
+      const ip = clientIp(req);
+      const blockedMs = loginBlocked(ip);
+      if (blockedMs > 0) {
+        res.writeHead(429, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Retry-After': String(Math.ceil(blockedMs / 1000)),
+          'Cache-Control': 'no-store',
+        });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: `Muitas tentativas — aguarde ${Math.ceil(blockedMs / 60000)} min.`,
+          }),
+        );
+        return;
+      }
       const body = await readBody(req);
-      if (body.user === ADMIN_USER && body.pass === ADMIN_PASSWORD) {
-        send(res, 200, { ok: true, token: adminToken() });
+      const userOk = safeEqualStr(String(body.user ?? ''), ADMIN_USER);
+      const passOk = safeEqualStr(String(body.pass ?? ''), ADMIN_PASSWORD);
+      if (userOk && passOk) {
+        clearLoginFailures(ip);
+        const { token, expiresAt } = issueAdminToken();
+        send(res, 200, { ok: true, token, expiresAt });
       } else {
+        registerLoginFailure(ip);
+        console.warn(`[auth] login recusado (ip=${ip})`);
         send(res, 401, { ok: false, error: 'Usuário ou senha incorretos.' });
       }
       return;
