@@ -63,7 +63,15 @@ export function statusFor(level: number): Status {
 
 const BASE = 'https://telemetriaws1.ana.gov.br/ServiceANA.asmx/DadosHidrometeorologicos';
 
-/** O serviço da ANA não envia cabeçalhos CORS: usamos proxies públicos como fallback. */
+/**
+ * Caminho primário: o PRÓPRIO backend do painel (`/api/ana/serie`) chama a
+ * ANA do lado do servidor — sem CORS, com cache de 10 min e fallback para a
+ * última série válida. É o caminho confiável.
+ *
+ * Caminho de contingência (abaixo): o serviço da ANA não envia cabeçalhos
+ * CORS, então chamadas diretas do navegador dependem de proxies públicos —
+ * instáveis, e por isso são apenas o último recurso.
+ */
 const PROXIES: { name: string; build: (url: string) => string; json?: boolean }[] = [
   { name: 'direto', build: (u) => u },
   { name: 'allorigins-raw', build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
@@ -156,6 +164,31 @@ export interface FetchResult {
 
 /** Busca a série telemétrica dos últimos `days` dias. */
 export async function fetchSeries(days: number): Promise<FetchResult> {
+  // 1) backend próprio (mesmo domínio, sem CORS, cache + fallback no servidor)
+  try {
+    const res = await fetch(`/api/ana/serie?codEstacao=${STATION.code}&days=${days}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(20000),
+    });
+    if (res.ok) {
+      const json = (await res.json()) as {
+        readings?: Reading[];
+        stale?: boolean;
+        fetchedAt?: number | null;
+      };
+      if (Array.isArray(json.readings) && json.readings.length) {
+        return {
+          readings: json.readings,
+          source: 'servidor',
+          fetchedAt: json.fetchedAt ?? Date.now(),
+        };
+      }
+    }
+  } catch {
+    /* segue para os proxies públicos */
+  }
+
+  // 2) contingência: proxies públicos (herdados — instáveis)
   const now = new Date();
   const start = new Date(now.getTime() - days * 86400000);
   // +1 dia no fim garante que o fuso do servidor não corte as leituras mais recentes

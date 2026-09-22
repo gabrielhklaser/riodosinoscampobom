@@ -44,9 +44,9 @@ function CustomTooltip({ active, payload, rainStations }: any) {
           </p>
         )}
         <p className="flex items-center gap-1.5">
-          <span className="inline-block h-2 w-2 rounded-sm bg-sky-400/80" />
+          <span className="inline-block h-2 w-2 rounded-sm bg-purple-400/80" />
           Chuva (média {rainStations} est.):{' '}
-          <span className="font-medium tabular-nums text-sky-300">{(r.rainAvg ?? 0).toFixed(1)} mm</span>
+          <span className="font-medium tabular-nums text-purple-300">{(r.rainAvg ?? 0).toFixed(1)} mm</span>
         </p>
         {r.rain != null && (
           <p className="pl-3.5 text-[11px] text-slate-500">Campo Bom (ANA): {r.rain.toFixed(1)} mm</p>
@@ -90,8 +90,8 @@ function RiverChart({ data, spanHours, showRain, rainStations }: Props) {
             <stop offset="100%" stopColor={color} stopOpacity={0.02} />
           </linearGradient>
           <linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.75} />
-            <stop offset="100%" stopColor="#0284c7" stopOpacity={0.25} />
+            <stop offset="0%" stopColor="#c084fc" stopOpacity={0.75} />
+            <stop offset="100%" stopColor="#9333ea" stopOpacity={0.25} />
           </linearGradient>
         </defs>
 
@@ -125,7 +125,7 @@ function RiverChart({ data, spanHours, showRain, rainStations }: Props) {
           orientation="right"
           domain={[0, rainMax]}
           allowDecimals
-          tick={{ fill: '#38bdf8', fontSize: 10 }}
+          tick={{ fill: '#c084fc', fontSize: 10 }}
           axisLine={false}
           tickLine={false}
           width={withRain ? 40 : 0}
@@ -149,7 +149,7 @@ function RiverChart({ data, spanHours, showRain, rainStations }: Props) {
             yAxisId="rain"
             dataKey="rainAvg"
             fill="url(#rainFill)"
-            stroke="#38bdf8"
+            stroke="#c084fc"
             strokeOpacity={0.35}
             strokeWidth={0.5}
             barSize={barSize}

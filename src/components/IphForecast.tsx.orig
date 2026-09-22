@@ -41,7 +41,7 @@ function ForecastTip({ active, payload, label, rainModel }: any) {
   }
   const rainVal = rainModel === 'gfs' ? row.rainGfs : row.rainEcmwf;
   if (rainVal > 0) {
-    const rc = '#d8b4fe';
+    const rc = rainModel === 'ecmwf' ? '#a5b4fc' : '#fda4af';
     items.push({ k: `Chuva ${rainModel === 'ecmwf' ? 'ECMWF' : 'GFS'}`, v: `${n1(rainVal)} mm`, c: rc });
   }
   if (!items.length) return null;
@@ -233,8 +233,8 @@ export default function IphForecast({ readings }: Props) {
                 <ComposedChart data={out.curve} margin={{ top: 8, right: 40, left: -8, bottom: 0 }}>
                   <defs>
                     <linearGradient id="rainBarFill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#c084fc" stopOpacity={0.8} />
-                      <stop offset="100%" stopColor="#9333ea" stopOpacity={0.3} />
+                      <stop offset="0%" stopColor={rainModel === 'ecmwf' ? '#818cf8' : '#fb7185'} stopOpacity={0.8} />
+                      <stop offset="100%" stopColor={rainModel === 'ecmwf' ? '#4f46e5' : '#be123c'} stopOpacity={0.3} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#1e293b" />
@@ -268,7 +268,7 @@ export default function IphForecast({ readings }: Props) {
                     orientation="right"
                     domain={[0, (d: number) => Math.max(4, Math.ceil(d * 2.5))]}
                     tickFormatter={(v: number) => `${v}mm`}
-                    tick={{ fill: '#c084fc', fontSize: 10 }}
+                    tick={{ fill: rainModel === 'ecmwf' ? '#818cf8' : '#fb7185', fontSize: 10 }}
                     axisLine={false}
                     tickLine={false}
                     width={38}
@@ -340,7 +340,7 @@ export default function IphForecast({ readings }: Props) {
               <span className="inline-flex items-center gap-1.5">
                 <span
                   className="h-3 w-3 rounded-sm"
-                  style={{ background: '#c084fc', opacity: 0.6 }}
+                  style={{ background: rainModel === 'ecmwf' ? '#818cf8' : '#fb7185', opacity: 0.6 }}
                 />
                 Chuva {rainModel === 'ecmwf' ? 'ECMWF' : 'GFS'} (mm)
               </span>

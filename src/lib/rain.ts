@@ -16,7 +16,7 @@
  * de fontes exibida abaixo do gráfico.
  */
 
-import type { Reading } from './ana';
+import { parseAnaXml, type Reading } from './ana';
 import { isInsideBasin } from './basin';
 
 export type RainProvider = 'ANA' | 'Open-Meteo';
@@ -307,8 +307,28 @@ async function fetchOpenMeteo(stations: RainStation[], days: number) {
 
 /**
  * Busca chuva da ANA para uma estação (15 min → horário).
+ *
+ * Caminho primário: o próprio backend (`/api/ana/serie`) — sem CORS e com o
+ * parser XML oficial compartilhado com a série principal (a versão anterior
+ * tentava regex sobre texto e não batia com o XML diffgram que a ANA
+ * devolve). Contingência: proxies públicos + o mesmo parser XML.
  */
 async function fetchAnaRain(code: string, days: number): Promise<Record<number, number>> {
+  // 1) backend próprio
+  try {
+    const res = await fetch(`/api/ana/serie?codEstacao=${code}&days=${days}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(20000),
+    });
+    if (res.ok) {
+      const json = (await res.json()) as { readings?: Reading[] };
+      return anaHourly(json.readings ?? []);
+    }
+  } catch {
+    /* tenta os proxies públicos */
+  }
+
+  // 2) contingência: proxies públicos + parser XML (não regex)
   const ANA_BASE = 'https://telemetriaws1.ana.gov.br/ServiceANA.asmx/DadosHidrometeorologicos';
   const now = new Date();
   const start = new Date(now.getTime() - days * 86400000);
@@ -330,25 +350,7 @@ async function fetchAnaRain(code: string, days: number): Promise<Record<number, 
       clearTimeout(t);
       if (!res.ok) continue;
       const xml = await res.text();
-
-      // parseia a coluna de chuva (3ª coluna numérica)
-      const hourly: Record<number, number> = {};
-      const re = new RegExp(
-        `${code}\\s+(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+[0-9.]*\\s+[0-9.]*\\s+([0-9.]+)`,
-        'g'
-      );
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(xml))) {
-        const d = new Date(m[1].replace(' ', 'T') + '-03:00');
-        const rain = Number(m[2]);
-        if (!isNaN(d.getTime()) && Number.isFinite(rain)) {
-          // agrega por hora cheia
-          const hk = hourKey(d.getTime());
-          hourly[hk] = (hourly[hk] || 0) + rain;
-        }
-      }
-      // arredonda
-      for (const k of Object.keys(hourly)) hourly[+k] = +hourly[+k].toFixed(1);
+      const hourly = anaHourly(parseAnaXml(xml));
       if (Object.keys(hourly).length > 0) return hourly;
     } catch {
       continue;

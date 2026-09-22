@@ -349,7 +349,7 @@ export default function App() {
                 </p>
                 <h1 className="flex items-center gap-2 text-base font-bold leading-tight tracking-tight text-white sm:text-lg">
                   <Waves className="h-4 w-4 shrink-0 text-blue-400" />
-                  Central de Monitoramento de Eventos Climáticos - {STATION.city}/{STATION.state}
+                  Nível do {STATION.river} — {STATION.city}/{STATION.state}
                 </h1>
                 <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-400">
                   <span className="inline-flex items-center gap-1">
@@ -472,6 +472,8 @@ export default function App() {
               </div>
             </div>
           )}
+
+          <TelegramSubscribe />
 
           {/* ---------- KPIs ---------- */}
           <section className="grid grid-cols-1 gap-4 lg:grid-cols-12">
@@ -622,7 +624,7 @@ export default function App() {
 
             <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-slate-800 pt-4 text-[11px] text-slate-400">
               <span className="inline-flex items-center gap-1.5"><span className="h-2 w-6 rounded" style={{ background: meta.color }} /> Nível do rio (m)</span>
-              <span className="inline-flex items-center gap-1.5"><span className="h-2 w-6 rounded bg-purple-400/70" /> Chuva — média de {activeRainStations} estações (mm)</span>
+              <span className="inline-flex items-center gap-1.5"><span className="h-2 w-6 rounded bg-sky-400/70" /> Chuva — média de {activeRainStations} estações (mm)</span>
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-yellow-400" /> Atenção {n2(COTAS.atencao)} m</span>
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-orange-400" /> Alerta {n2(COTAS.alerta)} m</span>
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-red-400" /> Inundação {n2(COTAS.inundacao)} m</span>
