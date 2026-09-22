@@ -4,3 +4,11 @@ dist/
 .env
 server/data/*.json
 server/data/*.tmp
+
+# Artefatos de merge/patch — nunca commite (já vazaram credenciais antigas aqui)
+*.orig
+*.rej
+*.BACKUP.*
+*.BASE.*
+*.LOCAL.*
+*.REMOTE.*

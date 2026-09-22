@@ -40,7 +40,7 @@ import AddressRisk, { type AddressPoint } from './components/AddressRisk';
 import FloodAlertModal from './components/FloodAlertModal';
 import InmetAlerts from './components/InmetAlerts';
 import IphForecast from './components/IphForecast';
-import { clearBotToken, loginBot, reportRiverReading } from './lib/botApi';
+import { clearBotToken, loginBot, reportRiverReading, UNAUTHORIZED_EVENT } from './lib/botApi';
 // import UpstreamRisk from './components/UpstreamRisk'; // desativado temporariamente
 import {
   COTAS,
@@ -98,8 +98,21 @@ export default function App() {
   const [showAllStations, setShowAllStations] = useState(false);
   const [isAdmin, setIsAdmin] = useState(() => sessionStorage.getItem('cb-admin') === '1');
   const [showLogin, setShowLogin] = useState(false);
-  const [loginError, setLoginError] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
   const [tab, setTab] = useState<'painel' | 'bot'>('painel');
+
+  // Token recusado pelo servidor (expirou/revogado): fecha o painel técnico.
+  useEffect(() => {
+    const onUnauthorized = () => {
+      sessionStorage.removeItem('cb-admin');
+      clearBotToken();
+      setIsAdmin(false);
+      setTab('painel');
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
 
   const cfg = useMemo(() => PERIODS.find((p) => p.key === period)!, [period]);
   const inFlight = useRef(false);
@@ -958,7 +971,7 @@ export default function App() {
                 <button
                   onClick={() => {
                     setShowLogin(true);
-                    setLoginError(false);
+                    setLoginError('');
                   }}
                   className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-800 px-3 py-1.5 text-[11px] text-slate-600 transition hover:border-slate-700 hover:text-slate-400"
                 >
@@ -994,19 +1007,27 @@ export default function App() {
               const form = e.currentTarget;
               const user = (form.elements.namedItem('user') as HTMLInputElement).value;
               const pass = (form.elements.namedItem('pass') as HTMLInputElement).value;
-              if (user === 'admin' && pass === 'CBdefesacivil2026') {
+              // Autenticação SOMENTE no servidor (/api/auth/login, senha via
+              // ADMIN_PASSWORD no ambiente). Nenhuma credencial existe no
+              // front-end — o bundle público não contém senha alguma.
+              if (loggingIn) return;
+              setLoggingIn(true);
+              setLoginError('');
+              try {
+                await loginBot(user, pass);
                 sessionStorage.setItem('cb-admin', '1');
-                try {
-                  await loginBot(user, pass);
-                } catch {
-                  /* o painel abre mesmo se a API estiver indisponível */
-                }
                 setIsAdmin(true);
                 setTab('bot');
                 setShowLogin(false);
-                setLoginError(false);
-              } else {
-                setLoginError(true);
+                form.reset();
+              } catch (err) {
+                setLoginError(
+                  err instanceof Error && !/^(HTTP |Failed to fetch)/.test(err.message)
+                    ? err.message
+                    : 'Usuário ou senha incorretos.',
+                );
+              } finally {
+                setLoggingIn(false);
               }
             }}
           >
@@ -1040,15 +1061,18 @@ export default function App() {
             />
 
             {loginError && (
-              <p className="mt-2 text-xs font-semibold text-red-400">Usuário ou senha incorretos.</p>
+              <p className="mt-2 text-xs font-semibold text-red-400" role="alert">
+                {loginError}
+              </p>
             )}
 
             <div className="mt-5 flex gap-2">
               <button
                 type="submit"
-                className="flex-1 rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-500"
+                disabled={loggingIn}
+                className="flex-1 rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Entrar
+                {loggingIn ? 'Verificando…' : 'Entrar'}
               </button>
               <button
                 type="button"

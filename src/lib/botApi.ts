@@ -63,6 +63,9 @@ export function clearBotToken() {
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
+/** Disparado quando o servidor recusa o token (401): o App faz logout automático. */
+export const UNAUTHORIZED_EVENT = 'cb-admin:unauthorized';
+
 async function request<T>(path: string, init: RequestInit = {}, auth = true): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -73,6 +76,11 @@ async function request<T>(path: string, init: RequestInit = {}, auth = true): Pr
   const res = await fetch(path, { ...init, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (auth && res.status === 401) {
+      // token expirado/inválido: limpa e avisa o App para fechar o painel
+      clearBotToken();
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
     throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data as T;
