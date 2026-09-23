@@ -287,7 +287,16 @@ function emptyStore() {
     lastReading: null,
     log: [],
     outbox: [],
-    bot: { username: TELEGRAM_BOT_USERNAME, ok: false, title: '', lastError: null },
+    bot: {
+      username: TELEGRAM_BOT_USERNAME,
+      ok: false,
+      title: '',
+      lastError: null,
+      id: null,
+      lastChecked: null,
+      lastSuccess: null,
+      consecutiveFails: 0,
+    },
     updateOffset: 0,
   };
 }
@@ -313,6 +322,15 @@ function loadStore() {
       fired: raw.fired && typeof raw.fired === 'object' ? raw.fired : {},
       log: Array.isArray(raw.log) ? raw.log.slice(-80) : [],
       outbox: Array.isArray(raw.outbox) ? raw.outbox : [],
+      bot: {
+        ...base.bot,
+        ...(raw.bot || {}),
+        username: (raw.bot && raw.bot.username) || base.bot.username,
+        ok: !!(raw.bot && raw.bot.ok),
+        lastChecked: (raw.bot && raw.bot.lastChecked) || null,
+        lastSuccess: (raw.bot && raw.bot.lastSuccess) || null,
+        consecutiveFails: Number((raw.bot && raw.bot.consecutiveFails) || 0),
+      },
     };
   } catch {
     return emptyStore();
@@ -474,11 +492,16 @@ async function tg(method, payload) {
     method: payload ? 'POST' : 'GET',
     headers: payload ? { 'Content-Type': 'application/json' } : undefined,
     body: payload ? JSON.stringify(payload) : undefined,
+    signal: AbortSignal.timeout(10000),
   });
   const data = await res.json().catch(() => ({}));
   if (!data.ok) {
     const desc = data.description || `HTTP ${res.status}`;
-    throw new Error(desc);
+    const authFail = /unauthorized|forbidden|invalid token/i.test(desc) || res.status === 401 || res.status === 403;
+    const err = new Error(desc);
+    err.code = authFail ? 'AUTH' : 'TRANSIENT';
+    err.status = res.status;
+    throw err;
   }
   return data.result;
 }
@@ -739,33 +762,53 @@ async function pollTelegram() {
         store.updateOffset = upd.update_id + 1;
         await handleUpdate(upd);
       }
-      saveStore();
       store.bot.ok = true;
       store.bot.lastError = null;
-    } catch (err) {
-      store.bot.ok = false;
-      store.bot.lastError = err instanceof Error ? err.message : 'falha no Telegram';
+      store.bot.lastChecked = Date.now();
+      store.bot.lastSuccess = Date.now();
+      store.bot.consecutiveFails = 0;
       saveStore();
+    } catch (err) {
+      const isAuth = err && err.code === 'AUTH';
+      store.bot.lastChecked = Date.now();
+      store.bot.consecutiveFails = (store.bot.consecutiveFails || 0) + 1;
+      if (isAuth || store.bot.consecutiveFails >= 3) {
+        store.bot.ok = false;
+        store.bot.lastError = err instanceof Error ? err.message : 'falha no Telegram';
+        saveStore();
+      } else {
+        store.bot.lastError = `transiente (`+store.bot.consecutiveFails+`/3): `+(err instanceof Error ? err.message : 'falha');
+        saveStore();
+      }
       await sleep(8000);
+      continue;
     }
+    await sleep(1500);
   }
 }
 
 async function verifyBot() {
+  const now = Date.now();
   try {
     const me = await tg('getMe');
-    store.bot = {
-      username: me.username || TELEGRAM_BOT_USERNAME,
-      ok: true,
-      title: me.first_name || 'Defesa Civil Campo Bom',
-      lastError: null,
-      id: me.id,
-    };
+    store.bot.username = me.username || TELEGRAM_BOT_USERNAME;
+    store.bot.title = me.first_name || 'Defesa Civil Campo Bom';
+    store.bot.id = me.id;
+    store.bot.ok = true;
+    store.bot.lastError = null;
+    store.bot.lastChecked = now;
+    store.bot.lastSuccess = now;
+    store.bot.consecutiveFails = 0;
     saveStore();
-    console.log(`[bot] autenticado como @${store.bot.username}`);
+    console.log(`[bot] autenticado como @`+store.bot.username);
     return true;
   } catch (err) {
-    store.bot.ok = false;
+    const isAuth = err && err.code === 'AUTH';
+    store.bot.lastChecked = now;
+    store.bot.consecutiveFails = (store.bot.consecutiveFails || 0) + 1;
+    if (isAuth || store.bot.consecutiveFails >= 3 || !store.bot.lastSuccess) {
+      store.bot.ok = false;
+    }
     store.bot.lastError = err instanceof Error ? err.message : 'token inválido';
     saveStore();
     console.error('[bot] falha ao autenticar:', store.bot.lastError);
@@ -826,6 +869,10 @@ async function startBot() {
   setInterval(() => {
     flushOutboxServer().catch(() => undefined);
   }, 15000);
+  // reverificação periódica: se polling travou ou modo webhook sem tráfego, mantém lastChecked atualizado
+  setInterval(() => {
+    verifyBot().catch(() => undefined);
+  }, 5 * 60 * 1000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -913,6 +960,10 @@ function publicConfig() {
       ok: !!store.bot.ok,
       title: store.bot.title || '',
       lastError: store.bot.lastError,
+      lastChecked: store.bot.lastChecked || null,
+      lastSuccess: store.bot.lastSuccess || null,
+      consecutiveFails: store.bot.consecutiveFails || 0,
+      id: store.bot.id || null,
       link: `https://t.me/${store.bot.username || TELEGRAM_BOT_USERNAME}`,
     },
     thresholds: store.thresholds,
@@ -1038,6 +1089,10 @@ const server = createServer(async (req, res) => {
         ok: true,
         bot: store.bot.username,
         online: !!store.bot.ok,
+        lastChecked: store.bot.lastChecked || null,
+        lastSuccess: store.bot.lastSuccess || null,
+        consecutiveFails: store.bot.consecutiveFails || 0,
+        lastError: store.bot.lastError || null,
         time: Date.now(),
       });
       return;
@@ -1083,7 +1138,12 @@ const server = createServer(async (req, res) => {
         return;
       }
       const reply = commandReply(body);
-      // não marcamos bot.ok aqui: o status real vem do polling/verifyBot
+      store.bot.lastChecked = Date.now();
+      store.bot.lastSuccess = Date.now();
+      store.bot.consecutiveFails = 0;
+      store.bot.ok = true;
+      store.bot.lastError = null;
+      saveStore();
       if (reply) {
         send(res, 200, {
           method: 'sendMessage',
@@ -1175,6 +1235,14 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && path === '/api/bot/config') {
+      send(res, 200, { ok: true, ...publicConfig() });
+      return;
+    }
+
+    if ((req.method === 'POST' || req.method === 'GET') && path === '/api/bot/verify') {
+      try {
+        await verifyBot();
+      } catch {}
       send(res, 200, { ok: true, ...publicConfig() });
       return;
     }

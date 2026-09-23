@@ -376,6 +376,8 @@ export default function IphForecast({ readings }: Props) {
                   const good = bt.accuracy >= 70;
                   const ok = bt.accuracy >= 40;
                   const semDados = bt.n === 0;
+                  void 0;
+                  const tlLabel = bt.trafficLight === 'green' ? 'verde' : bt.trafficLight === 'yellow' ? 'amarelo' : 'vermelho';
                   return (
                     <div
                       key={`${bt.model}-${bt.horizon}`}
@@ -392,6 +394,7 @@ export default function IphForecast({ readings }: Props) {
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold text-slate-200">
                           {bt.model === 'ecmwf' ? 'ECMWF' : 'GFS'} · +{bt.horizon} h
+                          {!semDados && <span className={`ml-1.5 inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-bold ring-1 ${bt.trafficLight==='green'?'bg-emerald-500/15 text-emerald-300 ring-emerald-400/30':bt.trafficLight==='yellow'?'bg-amber-500/15 text-amber-300 ring-amber-400/30':'bg-red-500/15 text-red-300 ring-red-400/30'}`}>{tlLabel} · {bt.exceptions} exc.</span>}
                         </span>
                         <span
                           className={`text-lg font-bold tabular-nums ${
@@ -443,7 +446,7 @@ export default function IphForecast({ readings }: Props) {
                             <span>±{n2(bt.tolerance)} m</span>
                             <span>{bt.n} pts</span>
                           </div>
-                          <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-800/60 pt-1.5 text-[10px] text-slate-500">
+                          <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-slate-800/60 pt-1.5 text-[10px] text-slate-500">
                             <span>
                               Persistência (MAE):{' '}
                               <strong className="text-slate-300">
@@ -452,7 +455,7 @@ export default function IphForecast({ readings }: Props) {
                             </span>
                             {bt.skillVsPersist != null && (
                               <span>
-                                Habilidade vs. persistência:{' '}
+                                Skill vs. persist.:{' '}
                                 <strong
                                   className={
                                     bt.skillVsPersist > 0
@@ -467,6 +470,10 @@ export default function IphForecast({ readings }: Props) {
                                 </strong>
                               </span>
                             )}
+                            <span>VaR<sub>95</sub>: <strong className="text-slate-300">{bt.var95 != null ? n2(bt.var95)+' m' : '—'}</strong></span>
+                            <span>CVaR<sub>95</sub>: <strong className="text-slate-300">{bt.cvar95 != null ? n2(bt.cvar95)+' m' : '—'}</strong></span>
+                            <span>VaR<sub>99</sub>: <strong className="text-slate-300">{bt.var99 != null ? n2(bt.var99)+' m' : '—'}</strong></span>
+                            <span>MaxDD: <strong className="text-slate-300">{bt.maxDrawdown != null ? n2(bt.maxDrawdown)+' m' : '—'}</strong></span>
                           </div>
                         </>
                       )}
@@ -532,12 +539,12 @@ export default function IphForecast({ readings }: Props) {
             escoam. base + remanso(Guaíba) − recessão K·(H−H_base).
             3 sub-bacias: alto (CN 65, lag 18 h) · médio (CN 72, lag 10 h) · baixo (CN 84, lag 4 h).
             Chuva passada (48 h) + futura (100 h) com defasagem por sub-bacia.
-            Interpolação IDW. API diário (γ=0,87) com saturação diferenciada.
+            Interpolação IDW. API diário (γ=0,87) com saturação diferenciada (stormwater-management SK-004).
+            SCS-CN em mm S=25400/CN−254 (hydrologic-modeling-engine CIV-SK-022) + modulação Xinanjiang b=ETA.
             Condição de contorno: nível do Guaíba (87450020, remanso k=0,15 acima de 1,50 m).
             Recessão: decaimento exponencial para H_base = 2,00 m (K = 0,004 h⁻¹).
-            Validação: MAE, RMSE, <strong className="text-emerald-300">Nash-Sutcliffe (NSE)</strong> e
-            linha de base de persistência (origens a cada 3 h nas últimas 72 h, chuva analisada
-            alinhada à origem — sem look-ahead).
+            Validação: MAE, RMSE, NSE, <strong className="text-emerald-300">VaR<sub>95</sub>/CVaR<sub>95</sub>, MaxDD e traffic-light de backtest</strong> (risk-metrics-calculation wshobson) + linha de base de persistência (origens a cada 3 h nas últimas 72 h, chuva analisada alinhada à origem — sem look-ahead).
+            Digest: IDF sintética regional avisa design storm T&gt;25 anos (stormwater-management).
             Estações: {IPH_STATIONS.map((s) => s.name).join(', ')}.
           </p>
         </>
