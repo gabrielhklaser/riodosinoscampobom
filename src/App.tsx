@@ -25,7 +25,6 @@ import LevelGauge from './components/LevelGauge';
 import Brasao from './components/Brasao';
 import RainMap from './components/RainMap';
 import BotSettings from './components/BotSettings';
-import TelegramSubscribe from './components/TelegramSubscribe';
 import {
   attachBasinRain,
   fetchRain,

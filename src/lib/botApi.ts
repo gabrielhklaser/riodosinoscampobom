@@ -41,6 +41,10 @@ export interface BotConfig {
     title: string;
     lastError: string | null;
     link: string;
+    lastChecked?: number | null;
+    lastSuccess?: number | null;
+    consecutiveFails?: number;
+    id?: number | null;
   };
   thresholds: BotThreshold[];
   subscribers: BotSubscriber[];
@@ -109,6 +113,10 @@ export function reportRiverReading(reading: {
 
 export function fetchBotConfig() {
   return request<BotConfig & { ok: boolean }>('/api/bot/config');
+}
+
+export function verifyBot() {
+  return request<BotConfig & { ok: boolean }>('/api/bot/verify', { method: 'POST' });
 }
 
 export function createThreshold(input: { name: string; meters: number; message: string }) {

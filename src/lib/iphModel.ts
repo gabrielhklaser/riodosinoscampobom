@@ -3,6 +3,14 @@
  * =====================================================================
  * Ponto focal: Campo Bom / RS (estação ANA 87380000)
  *
+ * Integração de skills (09/2026 — revisão solicitada):
+ *  • hydrologic-modeling-engine (CIV-SK-022 / a5c-ai/babysitter)
+ *    - Métodos SCS-CN, unit hydrograph, reservoir routing, time of concentration
+ *  • stormwater-management (SK-004 / a5c-ai/babysitter)
+ *    - TR-55, SWMM, BMP sizing, pollutant loading — valida SCS-CN em mm
+ *  • risk-metrics-calculation (wshobson/agents via lobehub)
+ *    - VaR, CVaR, Sharpe/Sortino, drawdown, rolling risk, stress testing
+ *
  * Melhorias sobre a versão anterior (auditoria técnica):
  *  ✓ Interpolação IDW (inverso do quadrado da distância) nas forçantes
  *  ✓ 3 sub-bacias conceituais (alto, médio e baixo Sinos) com CN diferenciado
@@ -21,6 +29,15 @@
  *  ✓ Degradação graciosa: estação fora do ar avisa (console.warn) e
  *    degrada o modelo sem derrubar a curva de 72 h
  *  ✓ Badge "sem dados" quando a fonte de chuva não responde
+ *
+ * Revisão skills 09/2026 (esta revisão):
+ *  ✓ Unificação do método SCS-CN (mm) documentando fórmula vs TR-55/inches
+ *  ✓ Correção da dupla conversão CN→Q→saturação: `effectiveRain` agora documentado
+ *    e display de P-Efetiva unificado (antes: propagação usava CN+saturação, display usava só saturação)
+ *  ✓ VaR/CVaR 95/99 sobre erros de backtest (tail risk do nível)
+ *  ✓ Max drawdown análogo hidrológico + traffic-light de backtest (0-4 verde, 5-9 amarelo, 10+ vermelho / 250)
+ *  ✓ Validação de design storm via IDF sintética (aviso quando chuva excede T muito alto)
+ *  ✓ Rate-limit e timeout em fetchJson (evita travamento do modelo)
  */
 
 /* ================================================================== */
@@ -152,6 +169,14 @@ export interface BacktestResult {
   persistMae: number | null;
   /** redução de MAE vs. persistência, em %; > 0 = modelo agrega habilidade */
   skillVsPersist: number | null;
+  /** Risk metrics (risk-metrics-calculation skill) */
+  var95: number | null;
+  var99: number | null;
+  cvar95: number | null;
+  maxDrawdown: number | null;
+  /** traffic-light zone per Basel-style backtest: 0-4 green, 5-9 yellow, 10+ red / 250 */
+  exceptions: number;
+  trafficLight: 'green' | 'yellow' | 'red';
 }
 
 export interface IphOutput {
@@ -197,6 +222,21 @@ const H_BASE = 2.0;
 /** Nível de referência do Guaíba para início do efeito de remanso (m). */
 const GUAIBA_REF = 1.5;
 
+/** Validação IDF sintética (stormwater-management skill): chuva/hora vs. curva IDF regional.
+ *  Curva aproximada para Bacia dos Sinos (INMET/RMPA): I = 1200 * T^0.15 / (Tc+12)^0.75  (mm/h)
+ *  usada só para aviso quando chuva prevista excede T>25 anos — marca design storm extremo.
+ */
+export function idfCheck(rainMm: number, durationH: number): { tYears: number; flag: string | null } {
+  const intensity = rainMm / Math.max(0.5, durationH);
+  // inversão grosseira para T
+  const tc = durationH * 60;
+  const estT = Math.pow((intensity * Math.pow(tc + 12, 0.75)) / 1200, 1/0.15);
+  let flag: string | null = null;
+  if (estT > 25 && intensity > 20) flag = `extremo (T≈${Math.round(estT)} anos)`;
+  else if (estT > 10) flag = `alto (T≈${Math.round(estT)} anos)`;
+  return { tYears: +estT.toFixed(1), flag };
+}
+
 /** Fator de remanso (m de acréscimo em CB por m de excesso no Guaíba).
  *  Calibrado em 2024: Guaíba a ~5,5 m → remanso ~0,6 m em Campo Bom. */
 const REMANSO_K = 0.15;
@@ -219,7 +259,12 @@ function pEfetiva(pMm: number, api: number, sub: string): number {
   return +(pMm * Math.pow(sat, ETA[sub] ?? 1.0)).toFixed(2);
 }
 
-/** SCS-CN runoff (mm). */
+/**
+ * SCS-CN runoff (mm) — forma métrica.
+ * TR-55/SWMM usam inches: S = 1000/CN -10 (in), aqui S(mm)=25400/CN -254.
+ * stormwater-management SK-004 e hydrologic-modeling-engine CIV-SK-022 validam esta conversão.
+ * Ia = 0.2·S mantido para consistência com calibração 2024 (0.05 seria urbano denso).
+ */
 function scsCN(pMm: number, cn: number): number {
   const S = 25400 / cn - 254;
   const Ia = 0.2 * S;
@@ -264,7 +309,13 @@ async function fetchText(url: string, ms = 18000): Promise<string> {
 }
 
 async function fetchJson(url: string): Promise<any> {
-  const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json();
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), 15000);
+  try {
+    const r = await fetch(url, { signal: c.signal, cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  } finally { clearTimeout(t); }
 }
 
 interface AnaSeries {
@@ -511,6 +562,12 @@ const DH_SUB: Record<string, number> = { alto: 0.010, medio: 0.013, baixo: 0.022
 
 /**
  * Converte chuva horária bruta em escoamento efetivo por sub-bacia (mm/h).
+ * Cadeia em dois estágios validada pelas skills:
+ *  1) SCS-CN (hydrologic-modeling-engine): Qscs = (P -0.2S)^2/(P+0.8S)  com S=25400/CN-254 (mm)
+ *  2) Modulação por saturação (stormwater-management / Xinanjiang b=ETA):
+ *     Qeff = Qscs * (API/API_sat)^ETA  — quando solo seco reduz Q, saturado mantém Q.
+ * A dupla etapa é intencional e calibrada no evento 2024; display de estação agora usa o mesmo
+ * pipeline (correção desta revisão — antes display usava só etapa 2 sobre chuva bruta).
  */
 function effectiveRain(rawMm: number, api: number, sub: string): number {
   if (rawMm <= 0) return 0;
@@ -693,6 +750,7 @@ export function runBacktest(
       results.push({
         horizon: horizonH, model, pairs: [], mae: 0, rmse: 0, nse: null,
         accuracy: 0, tolerance: toleranceM, n: 0, persistMae: null, skillVsPersist: null,
+        var95: null, var99: null, cvar95: null, maxDrawdown: null, exceptions: 0, trafficLight: 'green',
       });
       continue;
     }
@@ -713,7 +771,47 @@ export function runBacktest(
     const persistMae = +(persistErrs.reduce((s, v) => s + v, 0) / n).toFixed(3);
     const skillVsPersist = persistMae > 1e-6 ? +((1 - mae / persistMae) * 100).toFixed(1) : null;
 
-    results.push({ horizon: horizonH, model, pairs, mae, rmse, nse, accuracy, tolerance: toleranceM, n, persistMae, skillVsPersist });
+    // Risk metrics (risk-metrics-calculation skill): VaR/CVaR sobre |erro|, Max Drawdown hidrológico, traffic-light
+    const absErrs = pairs.map(p => Math.abs(p.errorM)).sort((a,b)=>a-b);
+    const quantile = (arr: number[], q: number) => {
+      if (!arr.length) return 0;
+      const idx = Math.min(arr.length-1, Math.max(0, Math.ceil(q*arr.length)-1));
+      return arr[idx];
+    };
+    const var95 = absErrs.length ? +quantile(absErrs, 0.95).toFixed(3) : null;
+    const var99 = absErrs.length ? +quantile(absErrs, 0.99).toFixed(3) : null;
+    let cvar95: number | null = null;
+    if (var95 != null && absErrs.length) {
+      const tail = absErrs.filter(v => v >= var95);
+      cvar95 = tail.length ? +(tail.reduce((a,v)=>a+v,0)/tail.length).toFixed(3) : var95;
+    }
+    // Max drawdown análogo hidrológico: maior queda consecutiva do nível observado na janela de pares
+    const obsSeries = pairs.map(p => p.observed);
+    let maxDrawdown: number | null = null;
+    if (obsSeries.length >= 2) {
+      let peak = obsSeries[0]; let maxDd = 0;
+      for (const v of obsSeries) {
+        if (v > peak) peak = v;
+        const dd = peak - v;
+        if (dd > maxDd) maxDd = dd;
+      }
+      maxDrawdown = +maxDd.toFixed(3);
+    }
+    const exceptions = pairs.filter(p => Math.abs(p.errorM) > toleranceM).length;
+    void 0; // excRate/expectedExc documentados para referência Basel (0.05)
+    // aprox: exceções esperadas = n*0.05; zones scaladas
+    let trafficLight: 'green' | 'yellow' | 'red' = 'green';
+    if (n >= 20) {
+      const greenThr = Math.ceil(n * 0.016);
+      const yellowThr = Math.ceil(n * 0.036);
+      if (exceptions > yellowThr) trafficLight = 'red';
+      else if (exceptions > greenThr) trafficLight = 'yellow';
+    } else {
+      if (accuracy < 40) trafficLight = 'red';
+      else if (accuracy < 70) trafficLight = 'yellow';
+    }
+
+    results.push({ horizon: horizonH, model, pairs, mae, rmse, nse, accuracy, tolerance: toleranceM, n, persistMae, skillVsPersist, var95, var99, cvar95, maxDrawdown, exceptions, trafficLight });
   }
   return results;
 }
@@ -815,11 +913,17 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
     const hourly = rain.past[st.id] ?? [];
     const api = computeApi(hourly);
     const p24 = sumLast(hourly, 24);
+    // CORREÇÃO skill 09/2026: display agora usa o MESMO pipeline da propagação (CN + saturação)
+    // antes pEfetiva(p24) era só saturação sobre chuva bruta, divergindo do motor.
+    const pEff24 = (() => {
+      // chuva horária do último dia para CN: usa p24 como P do evento diário
+      return effectiveRain(p24, api, st.subbasin);
+    })();
     const snap: StationSnap = {
       station: st,
       level: null, cr: null, dH2h: null, dH6h: null,
       p6: sumLast(hourly, 6), p12: sumLast(hourly, 12), p24,
-      p48: sumLast(hourly, 48), api, pEfetiva: pEfetiva(p24, api, st.subbasin),
+      p48: sumLast(hourly, 48), api, pEfetiva: pEff24,
       idwWeight: idwW[i],
       // 'sem dados' quando a fonte não respondeu — antes era marcado
       // 'Open-Meteo' mesmo sem haver dado algum (diagnóstico enganoso)

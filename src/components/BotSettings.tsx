@@ -9,6 +9,7 @@ import {
   Pencil,
   Plus,
   RadioTower,
+  RefreshCw,
   Send,
   Trash2,
   Users,
@@ -23,6 +24,7 @@ import {
   removeSubscriber,
   testThreshold,
   updateThreshold,
+  verifyBot as verifyBotStatus,
   type BotConfig,
   type BotThreshold,
 } from '../lib/botApi';
@@ -44,6 +46,7 @@ export default function BotSettings() {
   const [chatId, setChatId] = useState('6810701338');
   const [chatName, setChatName] = useState('Administrador');
   const [needLogin, setNeedLogin] = useState(false);
+  const [verifying, setVerifying] = useState(false);
 
   async function refresh() {
     const data = await fetchBotConfig();
@@ -105,6 +108,22 @@ export default function BotSettings() {
   function cancelEdit() {
     setEditing(null);
     setForm(EMPTY_FORM);
+  }
+
+  async function handleVerify() {
+    setVerifying(true);
+    setNotice(null);
+    setError(null);
+    try {
+      const data = await verifyBotStatus();
+      setCfg(data);
+      if (data.bot.ok) setNotice(`Bot reverificado: @`+data.bot.username+` online.`);
+      else setError(data.bot.lastError || 'Bot continua offline.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Falha ao reverificar.');
+    } finally {
+      setVerifying(false);
+    }
   }
 
   /**
@@ -202,8 +221,15 @@ export default function BotSettings() {
           <Stat
             icon={<RadioTower className="h-4 w-4" />}
             label="Status do bot"
-            value={cfg?.bot.ok ? 'Online' : 'Offline'}
-            hint={cfg?.bot.lastError || `@${cfg?.bot.username || BOT_USERNAME}`}
+            value={cfg?.bot.ok ? 'Online' : (cfg?.bot.consecutiveFails ? `Instável (${cfg.bot.consecutiveFails}/3)` : 'Offline')}
+            hint={(() => {
+              if (cfg?.bot.ok) {
+                const lc = cfg.bot.lastSuccess ? new Date(cfg.bot.lastSuccess).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : null;
+                return lc ? `@${cfg.bot.username || BOT_USERNAME} · ok em ${lc}` : `@${cfg.bot.username || BOT_USERNAME}`;
+              }
+              if (cfg?.bot.lastError && /transiente/.test(cfg.bot.lastError)) return cfg.bot.lastError;
+              return cfg?.bot.lastError || `@${cfg?.bot.username || BOT_USERNAME}`;
+            })()}
             ok={!!cfg?.bot.ok}
           />
           <Stat
@@ -225,6 +251,61 @@ export default function BotSettings() {
             ok={!!cfg?.lastReading}
           />
         </div>
+
+        {/* Diagnóstico de conexão — dupla checagem do status real */}
+        {cfg && !cfg.bot.ok && (
+          <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                <div>
+                  <p className="text-sm font-semibold text-amber-200">Bot aparece como Offline no painel</p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-amber-100/90">
+                    {cfg.bot.lastError && /invalid token|unauthorized|forbidden/i.test(cfg.bot.lastError)
+                      ? 'Token rejeitado pelo Telegram — verifique TELEGRAM_BOT_TOKEN no servidor (pode ter sido revogado).'
+                      : cfg.bot.lastError && /transiente/.test(cfg.bot.lastError)
+                        ? 'Falha transitória de rede do servidor com a API do Telegram — o bot pode estar online no Telegram mas o servidor ainda não conseguiu reconectar. Reverifique abaixo.'
+                        : 'O servidor não conseguiu confirmar o bot com getMe. Isso acontece quando há instabilidade de rede entre o servidor e api.telegram.org, mesmo que o bot responda normalmente dentro do Telegram.'}
+                  </p>
+                  <ul className="mt-2 list-disc space-y-0.5 pl-4 text-[11px] text-amber-100/70">
+                    <li>Última verificação: {cfg.bot.lastChecked ? new Date(cfg.bot.lastChecked).toLocaleString('pt-BR') : '—'}</li>
+                    <li>Último sucesso: {cfg.bot.lastSuccess ? new Date(cfg.bot.lastSuccess).toLocaleString('pt-BR') : 'nunca'}</li>
+                    <li>Falhas consecutivas: {cfg.bot.consecutiveFails ?? 0}/3</li>
+                    <li>Teste direto: abra <a className="underline" href={`https://t.me/${cfg.bot.username || BOT_USERNAME}`} target="_blank" rel="noreferrer">@{cfg.bot.username || BOT_USERNAME}</a> e envie /start — se responder, o token está válido e é só rede do servidor.</li>
+                  </ul>
+                </div>
+              </div>
+              <button
+                onClick={handleVerify}
+                disabled={verifying}
+                className="mt-3 inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/20 px-3.5 py-2 text-xs font-semibold text-amber-200 transition hover:bg-amber-500/30 disabled:opacity-60 sm:mt-0"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${verifying ? 'animate-spin' : ''}`} />
+                {verifying ? 'Reverificando...' : 'Reverificar agora'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {cfg && cfg.bot.ok && (cfg.bot.consecutiveFails ?? 0) > 0 && (
+          <div className="mt-4 rounded-xl border border-sky-500/30 bg-sky-500/10 p-3 text-xs text-sky-200">
+            Transiente de rede: {cfg.bot.lastError} — próxima tentativa automática em segundos. O bot segue ONLINE enquanto as falhas não atingem 3 consecutivas.
+          </div>
+        )}
+
+        {cfg && (
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleVerify}
+              disabled={verifying}
+              className="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800/60 px-3 py-1.5 text-[11px] font-semibold text-slate-300 transition hover:bg-slate-700/60 disabled:opacity-60"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${verifying ? 'animate-spin' : ''}`} />
+              {verifying ? 'Reverificando...' : 'Reverificar status'}
+            </button>
+            <span className="text-[11px] text-slate-500">Verificado em {cfg.bot.lastChecked ? new Date(cfg.bot.lastChecked).toLocaleString('pt-BR') : '—'} · sucesso em {cfg.bot.lastSuccess ? new Date(cfg.bot.lastSuccess).toLocaleString('pt-BR') : '—'}</span>
+          </div>
+        )}
       </section>
 
       {error && (
