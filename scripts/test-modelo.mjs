@@ -303,3 +303,127 @@ test('hidrologia: computeApi calcula o índice antecedente com decaimento diári
   assert.equal(computeApi(d3), apiDia3, `3 dias acumulados conferem com a fórmula analítica (${apiDia3} mm)`);
 });
 
+
+/* ------------------------------------------------------------------ */
+/* REVISÃO 09/2026-C — "ontem dizia que ia descer, hoje segue subindo"  */
+/* Dados REAIS da telemetria ANA, 21–24/09/2026                         */
+/* (scripts/fixtures/evento-2026-09.mjs)                                */
+/* ------------------------------------------------------------------ */
+
+import { limitDescent as limitDescentC, robustRateCmH as robustRateC } from '../src/lib/recession.ts';
+import {
+  ROUTING,
+  linearReservoir,
+  routeStation,
+  guideForCampoBom,
+} from '../src/lib/upstreamRouting.ts';
+import * as EV from './fixtures/evento-2026-09.mjs';
+
+const HR = 3600000;
+function rateAt(series, end, hours) {
+  const win = series.filter((p) => p.ts >= end - hours * HR && p.ts <= end + 60000);
+  return robustRateC(win.length >= 2 ? win : series, hours);
+}
+/** Previsão exatamente como o painel emite (sem chuva futura: o evento de
+ *  22–24/09 foi de propagação, sem chuva nova), emitida em `now`. */
+function forecastAt(now, H = 48) {
+  const cb = EV.until(EV.campoBom, now);
+  const cur = cb.at(-1).h;
+  const l2 = rateAt(cb, now, 2);
+  const l6 = rateAt(cb, now, 6);
+  const upstream = [
+    { id: 'ararica', name: 'Araricá', levels: EV.ararica },
+    { id: 'taquara', name: 'Taquara', levels: EV.taquara },
+  ];
+  const g = guideForCampoBom(upstream, EV.campoBom, now, l2, H);
+  const rain = new Array(RAIN_PAST_H + 120).fill(0);
+  const p = propagateCurve(cur, H, l6, l2, rain, 60, null, { rateGuideCmH: g.rates ?? undefined });
+  return { cur, stages: limitDescentC(p.stages), g };
+}
+
+test('cheia 23/09/2026: emitida às 09h, prevê SUBIDA e acerta +24 h (obs. 6,79 m)', () => {
+  const now = EV.at(23, 9);
+  const { cur, stages } = forecastAt(now);
+  const obs24 = EV.obsAt(EV.campoBom, now + 24 * HR);
+  assert.equal(obs24, 6.79);
+  assert.ok(stages[24] > cur + 0.15, `previsão +24 h ${stages[24].toFixed(2)} deve subir de ${cur}`);
+  assert.ok(Math.abs(stages[24] - obs24) <= 0.12, `erro +24 h ${(stages[24] - obs24).toFixed(2)} m (modelo antigo: −0,57 m)`);
+});
+
+test('cheia 21–24/09/2026: 11 previsões a cada 3 h — RMSE +24 h ≤ 0,10 m e sem viés de descida', () => {
+  const errs = [];
+  for (let now = EV.at(22, 3); now <= EV.at(24, 9); now += 3 * HR) {
+    const obs = EV.obsAt(EV.campoBom, now + 24 * HR);
+    if (obs == null) continue;
+    errs.push(forecastAt(now).stages[24] - obs);
+  }
+  assert.ok(errs.length >= 10, `n=${errs.length}`);
+  const rmse = Math.sqrt(errs.reduce((a, v) => a + v * v, 0) / errs.length);
+  const bias = errs.reduce((a, v) => a + v, 0) / errs.length;
+  const worst = Math.max(...errs.map(Math.abs));
+  assert.ok(rmse <= 0.1, `RMSE +24 h = ${rmse.toFixed(3)} m (modelo antigo 0,49 m)`);
+  assert.ok(Math.abs(bias) <= 0.05, `viés +24 h = ${bias.toFixed(3)} m (modelo antigo −0,48 m)`);
+  assert.ok(worst <= 0.15, `pior erro +24 h = ${worst.toFixed(3)} m`);
+});
+
+test('roteamento: guia não usa dado do futuro (sem look-ahead)', () => {
+  const now = EV.at(23, 9);
+  const cb = EV.until(EV.campoBom, now);
+  const up = (full) => [
+    { id: 'ararica', name: 'Araricá', levels: full ? EV.ararica : EV.until(EV.ararica, now) },
+    { id: 'taquara', name: 'Taquara', levels: full ? EV.taquara : EV.until(EV.taquara, now) },
+  ];
+  const a = guideForCampoBom(up(true), EV.campoBom, now, 1.5, 48).rates;
+  const b = guideForCampoBom(up(false), cb, now, 1.5, 48).rates;
+  assert.deepEqual(a, b);
+  assert.equal(guideForCampoBom(up(false), cb, now, 1.5, 48).guide.horizonH, ROUTING.taquara.lag);
+});
+
+test('roteamento: estação com última leitura > 6 h não entra no guia', () => {
+  const now = EV.at(23, 9);
+  const velho = EV.until(EV.taquara, now - 8 * HR);
+  assert.equal(routeStation('taquara', 'Taquara', velho, EV.until(EV.campoBom, now), now), null);
+  assert.ok(routeStation('taquara', 'Taquara', EV.until(EV.taquara, now), EV.until(EV.campoBom, now), now));
+});
+
+test('roteamento: reservatório linear achata a enxurrada e conserva o volume', () => {
+  // série começa em regime (taxa 0) — como em produção, 240 h de histórico
+  const pulso = [...new Array(24).fill(0), ...new Array(6).fill(37), ...new Array(300).fill(0)];
+  const out = linearReservoir(pulso, ROUTING.taquara.k);
+  const vin = pulso.reduce((a, v) => a + v, 0);
+  const vout = out.reduce((a, v) => a + v, 0);
+  const pico = Math.max(...out);
+  assert.ok(pico < 37 * 0.35, `pico amortecido: ${pico.toFixed(1)} cm/h (entrada 37)`);
+  assert.ok(Math.abs(vout - vin) / vin < 0.01, `volume conservado: ${vout.toFixed(1)} × ${vin}`);
+});
+
+test('motor: taxa observada NÃO sofre recessão em dobro (guia +1,5 cm/h a 6,5 m)', () => {
+  const guide = new Array(24).fill(1.5);
+  const rain = new Array(RAIN_PAST_H + 100).fill(0);
+  const p = propagateCurve(6.5, 24, 1.5, 1.5, rain, 60, null, { rateGuideCmH: guide });
+  const rise = p.stages[24] - 6.5;
+  // 24 h × 1,5 cm/h = 0,36 m (+ escoamento de base desprezível)
+  assert.ok(Math.abs(rise - 0.36) < 0.03, `subida ${rise.toFixed(3)} m ≈ 0,36 m`);
+  // sem guia e sem taxa, a recessão continua integral (calibração intacta)
+  const q = propagateCurve(6.5, 24, 0, 0, rain, 60, null);
+  assert.ok(q.stages[24] < 6.5 - 0.3, `recessão sem taxa: ${q.stages[24].toFixed(2)} m`);
+});
+
+test('motor: com guia, chuva JÁ CAÍDA no alto/médio não é contada duas vezes', () => {
+  const guide = new Array(24).fill(0.5);
+  const seco = new Array(RAIN_PAST_H + 100).fill(0);
+  const passado = seco.slice();
+  for (let i = 0; i < RAIN_PAST_H - 12; i++) passado[i] = 3; // chuva forte até 12 h atrás
+  const a = propagateCurve(5, 24, 0.5, 0.5, seco, API_SATURADO, null, { rateGuideCmH: guide });
+  const b = propagateCurve(5, 24, 0.5, 0.5, passado, API_SATURADO, null, { rateGuideCmH: guide });
+  assert.deepEqual(a.stages, b.stages, 'a onda dessa chuva já está nos níveis medidos a montante');
+});
+
+test('motor: rainBySub igual à média reproduz a curva de bacia única', () => {
+  const rain = hyetograph2024(0);
+  const a = propagateCurve(2.3, 72, 0, 0, rain, API_SATURADO, null);
+  const b = propagateCurve(2.3, 72, 0, 0, rain, API_SATURADO, null, {
+    rainBySub: { alto: rain, medio: rain, baixo: rain },
+  });
+  assert.deepEqual(a.stages, b.stages);
+});
