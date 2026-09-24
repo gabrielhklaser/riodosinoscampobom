@@ -1067,6 +1067,96 @@ function parseAnaXml(xml) {
   return out.filter((r, i) => i === 0 || r.ts !== out[i - 1].ts);
 }
 
+/* ------------------------------------------------------------------ */
+/* /api/ana/serie — série de qualquer estação da bacia (público)       */
+/* ------------------------------------------------------------------ */
+// O painel (ana.ts, rain.ts, iphModel.ts) já chamava esta rota, mas ela não
+// existia: tudo caía nos proxies públicos (allorigins/corsproxy), instáveis
+// e lentos — estações "sem dados" no modelo. Lista fechada de códigos (não é
+// um proxy aberto), cache de 10 min por estação e reserva com o último
+// retorno bom (stale) se a ANA cair.
+const ANA_SERIE_CODES = new Set([
+  // Sinos — telemétricas ANA/SGB/DCRS (lista ListaEstacoesTelemetricas)
+  '87318700', '87318000', '87337010', '87350000', '87351000', '87366500',
+  '87375500', '87376000', '87377400', '87377500', '87380000', '87382000',
+  '87385010', '87385041', '2950108', '02950108',
+  // Guaíba (condição de contorno a jusante)
+  '87450020',
+]);
+const ANA_SERIE_TTL_MS = 10 * 60 * 1000;
+const anaSerieCache = new Map(); // key → { at, body }
+
+/** DataHora da ANA é hora LOCAL de Brasília (UTC−3, sem horário de verão
+ *  desde 2019) — converte explicitamente, independente do fuso do servidor. */
+function anaTsBrasilia(raw) {
+  const m = String(raw || '').match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] + 3, +m[5], +(m[6] || 0));
+}
+
+/** Parser completo: mantém registros só de chuva (pluviômetros sem régua),
+ *  que o parseAnaXml do bot descarta (ele exige nível > 0). */
+function parseAnaSerieXml(xml) {
+  const parts = xml.split(/<DataHora>/i);
+  const byTs = new Map();
+  const num = (v) => {
+    if (v == null) return null;
+    const t = String(v).trim().replace(',', '.');
+    if (!t) return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+  for (let i = 1; i < parts.length; i++) {
+    const ts = anaTsBrasilia(parts[i].match(/^([^<]+)/)?.[1]);
+    if (ts == null) continue;
+    const chunk = parts[i].slice(0, 1200);
+    const nivelCm = num(chunk.match(/<Nivel>([^<]*)<\/Nivel>/i)?.[1]);
+    const flow = num(chunk.match(/<Vazao>([^<]*)<\/Vazao>/i)?.[1]);
+    const rain = num(chunk.match(/<Chuva>([^<]*)<\/Chuva>/i)?.[1]);
+    if ((nivelCm == null || nivelCm <= 0) && rain == null) continue;
+    byTs.set(ts, { ts, nivelCm, flow, rain });
+  }
+  const recs = [...byTs.values()].sort((a, b) => a.ts - b.ts);
+  return {
+    readings: recs
+      .filter((r) => r.nivelCm != null && r.nivelCm > 0)
+      .map((r) => ({ ts: r.ts, level: +(r.nivelCm / 100).toFixed(2), flow: r.flow, rain: r.rain })),
+    rain: recs.filter((r) => r.rain != null && r.rain >= 0).map((r) => ({ ts: r.ts, mm: r.rain })),
+  };
+}
+
+async function fetchAnaSerie(code, days) {
+  const key = `${code}:${days}`;
+  const hit = anaSerieCache.get(key);
+  if (hit && Date.now() - hit.at < ANA_SERIE_TTL_MS) return hit.body;
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 86400000);
+  const end = new Date(now.getTime() + 86400000);
+  const url = `${ANA_URL}?codEstacao=${code}&dataInicio=${brDate(start)}&dataFim=${brDate(end)}`;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    let xml;
+    try {
+      const r = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+      if (!r.ok) throw new Error(`ANA HTTP ${r.status}`);
+      xml = await r.text();
+    } finally {
+      clearTimeout(timer);
+    }
+    const parsed = parseAnaSerieXml(xml);
+    if (!parsed.readings.length && !parsed.rain.length) throw new Error('ANA sem registros');
+    const body = { ok: true, codEstacao: code, ...parsed, fetchedAt: Date.now(), stale: false };
+    anaSerieCache.set(key, { at: Date.now(), body });
+    // limita a memória: descarta entradas com mais de 1 h
+    for (const [k, v] of anaSerieCache) if (Date.now() - v.at > 3600000) anaSerieCache.delete(k);
+    return body;
+  } catch (err) {
+    if (hit) return { ...hit.body, stale: true };
+    throw err;
+  }
+}
+
 async function fetchAnaLatest() {
   const now = new Date();
   const start = new Date(now.getTime() - 2 * 86400000);
@@ -1278,6 +1368,23 @@ const server = createServer(async (req, res) => {
         fallback: r.fallback,
         avisos: r.avisos,
       });
+      return;
+    }
+
+    // Série telemétrica da ANA para as estações da bacia — PÚBLICO (dados
+    // abertos), lista fechada de códigos, cache de 10 min, reserva stale.
+    if (req.method === 'GET' && path === '/api/ana/serie') {
+      const code = String(url.searchParams.get('codEstacao') || '').trim();
+      const days = Math.min(30, Math.max(1, Math.round(Number(url.searchParams.get('days')) || 3)));
+      if (!ANA_SERIE_CODES.has(code)) {
+        send(res, 400, { ok: false, error: 'codEstacao fora da lista da bacia.' });
+        return;
+      }
+      try {
+        send(res, 200, await fetchAnaSerie(code, days));
+      } catch (err) {
+        send(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err), readings: [], rain: [] });
+      }
       return;
     }
 

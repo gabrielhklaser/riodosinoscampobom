@@ -157,6 +157,27 @@ export function remanso(guaibaLevel: number | null): number {
  * @param dH6h — taxa nas últimas 6 h (cm/h) — momentum estável
  * @param dH2h — taxa nas últimas 2 h (cm/h) — responsividade imediata
  */
+/** Decaimento (h) da última taxa guiada além do horizonte da estação mais distante
+ * (20 h = mesmo decaimento da persistência local; com 12 h, "só Araricá"
+ * ficava pior que sem guia: RMSE +24 h 0,38 m × 0,25 m). */
+export const GUIDE_DECAY_H = 20;
+
+export interface PropagateOpts {
+  /**
+   * Taxa prevista em Campo Bom (cm/h) para cada hora t (índice t−1), obtida
+   * pela propagação das estações a montante (routedRateGuide + blendWithLocal).
+   * null = hora sem informação a montante.
+   */
+  rateGuideCmH?: (number | null)[];
+  /**
+   * Chuva horária POR SUB-BACIA (média areal das estações da sub-bacia no
+   * passado + previsão no centróide da sub-bacia no futuro), mesmo
+   * alinhamento de `rainTimeline` (índice RAIN_PAST_H = agora). Sub-bacia
+   * ausente usa `rainTimeline`.
+   */
+  rainBySub?: Partial<Record<'alto' | 'medio' | 'baixo', number[]>>;
+}
+
 export function propagateCurve(
   current: number,
   maxH: number,
@@ -164,7 +185,8 @@ export function propagateCurve(
   dH2h: number | null,
   rainTimeline: number[],
   meanApi: number,
-  guaibaLevel: number | null
+  guaibaLevel: number | null,
+  opts: PropagateOpts = {}
 ): { stages: number[]; inertials: number[]; rains: number[]; rems: number[] } {
   const stages: number[] = [current];
   const inertials: number[] = [0];
@@ -188,18 +210,59 @@ export function propagateCurve(
   //      • subida → entra intacta (enxurrada pode dar guinada para cima);
   //      • descida → rampa de entrada (1 − e^(−t/5 h)) e queda limitada a
   //        12 cm/h (MAX_DROP_H), PRESERVANDO o impulso negativo total.
+  //
+  //    Com guia a montante (opts.rateGuideCmH): a taxa de cada hora vem da
+  //    PROPAGAÇÃO dos níveis medidos nas estações a montante (defasagem,
+  //    reservatório e ganho calibrados — ver upstreamRouting.ts). Além do
+  //    horizonte que a
+  //    estação mais distante cobre, a última taxa guiada decai com
+  //    e^(−Δt/GUIDE_DECAY_H).
+  //
+  //    persist[t] ∈ [0,1] = quanto da hora t é "taxa observada" (líquida).
+  //    Essa taxa JÁ inclui o efeito da recessão natural — a recessão só se
+  //    aplica à fração (1 − persist). Antes a recessão era SOMADA por cima
+  //    da persistência: com o rio a 6,5 m ela tirava ~1,8 cm/h de uma
+  //    subida real de 1,5 cm/h e o modelo previa queda (erro de −0,55 m em
+  //    24 h na cheia de 23/09/2026).
+  const guide = opts.rateGuideCmH;
+  const hasGuide = !!guide && guide.some((v) => v != null && Number.isFinite(v));
   const rawRates: number[] = [];
+  const persist: number[] = [];
+  let lastGuideT = 0;
+  let lastGuide = 0;
   for (let t = 1; t <= maxH; t++) {
     const w2 = Math.exp(-t / 6);
     const w6 = Math.exp(-t / 20);
-    const blendRate = w2 * r2 + (1 - w2) * r6 * w6;
-    rawRates.push(Math.abs(blendRate) > 0.02 ? blendRate / 100 : 0);
+    if (hasGuide) {
+      const g = guide![t - 1];
+      if (g != null && Number.isFinite(g)) {
+        lastGuideT = t;
+        lastGuide = g;
+        rawRates.push(Math.abs(g) > 0.02 ? g / 100 : 0);
+        persist.push(1);
+      } else {
+        const d = Math.exp(-(t - lastGuideT) / GUIDE_DECAY_H);
+        const v = lastGuide * d;
+        rawRates.push(Math.abs(v) > 0.02 ? v / 100 : 0);
+        persist.push(d);
+      }
+    } else {
+      const blendRate = w2 * r2 + (1 - w2) * r6 * w6;
+      rawRates.push(Math.abs(blendRate) > 0.02 ? blendRate / 100 : 0);
+      // Sem guia: a fração "observada" é o próprio peso da persistência.
+      // Taxas nulas → persist 0 → recessão integral (calibração 2024 intacta).
+      const active = Math.abs(r2) > 0.02 || Math.abs(r6) > 0.02;
+      persist.push(active ? w2 + (1 - w2) * w6 : 0);
+    }
   }
   const inertialRates = shapeRateSeries(rawRates, { tauFallH: 5, maxDropPerHourM: MAX_DROP_H });
 
   // 2. Chuva do evento: runoff acumulado (SCS-CN + AMC) por sub-bacia,
   //    consumido como incremento horário e defasado pelo lag da sub-bacia.
-  const runoff = runoffSeriesBySub(rainTimeline, meanApi);
+  const tlFor = (sub: 'alto' | 'medio' | 'baixo') => opts.rainBySub?.[sub] ?? rainTimeline;
+  const runoff: Record<string, number[]> = opts.rainBySub
+    ? Object.fromEntries(subbasins.map((sub) => [sub, effectiveRunoffSeries(tlFor(sub), cnForSub(sub, meanApi))]))
+    : runoffSeriesBySub(rainTimeline, meanApi);
 
   let h = current;
 
@@ -211,7 +274,12 @@ export function propagateCurve(
     for (const sub of subbasins) {
       const lag = LAG[sub];
       const tlIdx = RAIN_PAST_H + t - lag;
-      if (tlIdx >= 0 && tlIdx < rainTimeline.length) {
+      // Com guia a montante, a chuva JÁ CAÍDA sobre alto/médio já está nos
+      // níveis medidos a montante (que o guia propaga) — só a chuva FUTURA
+      // entra aqui, para não contar duas vezes. O baixo (entre Araricá e
+      // Campo Bom) não é visto pelas estações a montante: conta inteiro.
+      if (hasGuide && sub !== 'baixo' && tlIdx < RAIN_PAST_H) continue;
+      if (tlIdx >= 0 && tlIdx < tlFor(sub).length) {
         const pEff = runoff[sub]?.[tlIdx] ?? 0;
         if (pEff > 0) {
           rainContrib += pEff * (SUB_DH[sub] ?? 0.094) * (SUB_AREA_FRAC[sub] ?? 0.33);
@@ -228,7 +296,7 @@ export function propagateCurve(
     //    rápido o rio recede. Sempre ativa: em cheia age como amortecimento
     //    leve do armazenamento; em período seco desenha a recessão real
     //    em vez de congelar o nível.
-    const recession = -K_RECESSAO * (h - H_BASE);
+    const recession = -K_RECESSAO * (h - H_BASE) * (1 - (persist[t - 1] ?? 0));
 
     // 5. Acumula
     const remT = remByHour(t);

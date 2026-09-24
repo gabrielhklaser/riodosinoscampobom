@@ -55,6 +55,31 @@
  *  ✓ Taxas de 2 h/6 h passam a usar Theil–Sen (robusto a leitura espúria).
  *  ✓ Calibração do evento 2024 virou verificável por teste
  *    (scripts/test-modelo.mjs — `npm run test:modelo`).
+ *
+ * Revisão 09/2026-C (relato: "ontem a previsão dizia que o rio ia parar de
+ * subir e descer; hoje continuou subindo") — verificado com a telemetria
+ * real de 21–24/09/2026 (scripts/fixtures/evento-2026-09.mjs):
+ *  ✓ CAUSA 1 — recessão contada em dobro: a taxa observada de Campo Bom já
+ *    é líquida (inclui a recessão natural), mas o motor somava por cima
+ *    −K·(H−H_base) ≈ −1,8 cm/h a 6,5 m. Com o rio subindo 1,5 cm/h, a
+ *    curva virava para baixo. Agora a recessão só age sobre a fração não
+ *    observada da taxa (iphEngine.propagateCurve, persist[t]).
+ *  ✓ CAUSA 2 — taxa de Taquara sem defasagem: 60 % da taxa ATUAL de
+ *    Taquara (já descendo desde 23/09 01h) entrava instantaneamente em
+ *    Campo Bom, mas a onda leva > 1 dia pelos banhados. Agora: roteamento
+ *    lag + reservatório linear (upstreamRouting.ts) com Araricá (87377500,
+ *    antes ignorada, a 10 km de CB) e Taquara.
+ *    Resultado em 11 previsões (22/09 03h → 24/09 09h), erro em +24 h:
+ *    modelo antigo RMSE 0,49 m / viés −0,48 m → novo RMSE 0,04 m.
+ *  ✓ Todas as estações telemétricas da ANA na bacia a montante de CB
+ *    (12, exceto UHEs) + 17 pontos CEMADEN/DC dentro do polígono: chuva
+ *    média areal por sub-bacia (ANA medido; Open-Meteo onde não há) no
+ *    lugar do IDW centrado em Campo Bom; previsão ECMWF/GFS no centróide
+ *    de cada sub-bacia; Guaíba e São Leopoldo saíram da chuva a montante.
+ *  ✓ Rota /api/ana/serie criada no servidor (o cliente já a chamava, mas
+ *    ela não existia — tudo dependia de proxies públicos).
+ *  ✗ Testado e NÃO adotado: hidrograma unitário triangular SCS no lugar
+ *    do lag puro — piorou o ajuste do evento (RMSE 0,83–0,90 m × 0,77 m).
  */
 
 import { COTAS } from './ana';
@@ -66,10 +91,13 @@ import {
   API_SAT_REF,
   GAMMA,
   RAIN_PAST_H,
+  SUB_AREA_FRAC,
   cnForSub,
   computeApi,
   propagateCurve,
+  type PropagateOpts,
 } from './iphEngine';
+import { ROUTING, guideForCampoBom, type UpstreamInput } from './upstreamRouting';
 
 /* ================================================================== */
 /* Classificação de risco                                              */
@@ -112,49 +140,88 @@ export function classFor(stage: number): IphClass {
 /* Sub-bacias e estações                                               */
 /* ================================================================== */
 
+export type Sub = 'alto' | 'medio' | 'baixo';
+
 export interface IphStation {
   id: string;
   name: string;
   city: string;
-  anaCode: string;
+  /** código telemétrico da ANA; null = ponto sem telemetria (chuva Open-Meteo) */
+  anaCode: string | null;
+  /** fluvio = tem régua (nível) + pluviômetro; pluvio = só chuva */
   kind: 'fluvio' | 'pluvio';
   lat: number;
   lon: number;
-  lagH: number;
-  weight: number;
-  critical: number;
   /** sub-bacia: alto (cabeceiras), medio, baixo */
-  subbasin: 'alto' | 'medio' | 'baixo';
+  subbasin: Sub;
+  /** cota crítica local (m, referência da estação); 0 = não definida */
+  critical: number;
+  /** fonte da chuva: 'ana' (pluviômetro telemétrico) ou 'om' (Open-Meteo no ponto) */
+  rainFrom: 'ana' | 'om';
+  /** id em ROUTING (upstreamRouting.ts) — nível entra no guia de taxa */
+  routeId?: string;
 }
 
 /*
- * CN por sub-bacia (bibliografia FEPAM/Comitesinos + MapBiomas):
- *  alto  (serra, mata + pastagem): CN ~65   |  medio (rural misto): CN ~72
- *  baixo (urbano + várzea):        CN ~84
+ * ESTAÇÕES DO MODELO — revisão 09/2026-C.
  *
- * CN_II, LAG, AREA_FRAC, DH_SUB e os ganhos da calibração vivem em
- * ./rainRunoff e ./iphEngine — fonte única para o motor, para este arquivo
- * e para o teste de calibração (scripts/test-modelo.mjs). */
-
-/**
- * Estações do modelo — prioridade ANA (dados medidos) sobre Open-Meteo.
- * `anaRain: true` = a estação retorna chuva pelo webservice da ANA (testado).
+ * TODAS as estações telemétricas da ANA dentro da bacia do Sinos a montante
+ * de Campo Bom (ListaEstacoesTelemetricas, verificadas transmitindo em
+ * 24/09/2026; as 4 estações de UHE do Paranhana foram excluídas — nível de
+ * reservatório operado não é sinal de cheia natural), mais os pontos
+ * CEMADEN/Defesa Civil dentro do polígono da bacia (basin.ts) sem
+ * telemetria pública, usados com a chuva Open-Meteo no ponto.
+ *
+ * Saíram da conta a montante: Guaíba/Gasômetro (87450020, fica em Porto
+ * Alegre, fora da bacia — segue só como condição de contorno de remanso) e
+ * São Leopoldo (87382000, a JUSANTE de Campo Bom: a chuva lá não chega a
+ * Campo Bom). Corrigido: "Canastra 2950123" era o código Defesa Civil de
+ * Rolante — Rio Mascarada, que tem telemetria ANA própria (87337010).
  */
-export const IPH_STATIONS: (IphStation & { anaRain: boolean })[] = [
-  { id: 'caraa',         name: 'Caraá (ANA)',               city: 'Caraá',       anaCode: '87318700', kind: 'pluvio', lat: -29.7692, lon: -50.3572, lagH: 21, weight: 0.06,  critical: 0,   subbasin: 'alto',  anaRain: true },
-  { id: 'alto-rolante',  name: 'Alto Rolante',             city: 'Rolante',     anaCode: '2950098',  kind: 'pluvio', lat: -29.645,  lon: -50.5106, lagH: 18, weight: 0.06,  critical: 0,   subbasin: 'alto',  anaRain: false },
-  { id: 'rolante',       name: 'Rolante',                  city: 'Rolante',     anaCode: '2950122',  kind: 'pluvio', lat: -29.6653, lon: -50.5819, lagH: 16, weight: 0.08,  critical: 0,   subbasin: 'medio', anaRain: false },
-  { id: 'canastra',      name: 'Canastra',                 city: 'Rolante',     anaCode: '2950123',  kind: 'pluvio', lat: -29.5825, lon: -50.4697, lagH: 15, weight: 0.08,  critical: 0,   subbasin: 'medio', anaRain: false },
-  { id: 'taquara',       name: 'Taquara (Foz Paranhana)',  city: 'Taquara',     anaCode: '87376000', kind: 'fluvio', lat: -29.6858, lon: -50.8122, lagH: 10, weight: 0.25,  critical: 5.9, subbasin: 'medio', anaRain: false },
-  { id: 'sapiranga',     name: 'Sapiranga',                city: 'Sapiranga',   anaCode: '2951040',  kind: 'pluvio', lat: -29.6333, lon: -51.0,    lagH: 3,  weight: 0.15,  critical: 0,   subbasin: 'baixo', anaRain: false },
-  // ---- ESTAÇÕES COM PLUVIÔMETRO DA ANA (dados medidos, 15 min) ----
-  { id: 'campo-bom',     name: 'Campo Bom (ANA)',          city: 'Campo Bom',   anaCode: '87380000', kind: 'pluvio', lat: -29.6917, lon: -51.0461, lagH: 0,  weight: 0.16,  critical: 0,   subbasin: 'baixo', anaRain: true },
-  { id: 'sao-leopoldo',  name: 'São Leopoldo (ANA)',       city: 'São Leopoldo',anaCode: '87382000', kind: 'fluvio', lat: -29.7589, lon: -51.1483, lagH: 0,  weight: 0.10,  critical: 4.5, subbasin: 'baixo', anaRain: true },
-  { id: 'guaiba-chuva',  name: 'Guaíba/Gasômetro (ANA)',   city: 'Porto Alegre',anaCode: '87450020', kind: 'pluvio', lat: -30.0347, lon: -51.2419, lagH: 0,  weight: 0.06,  critical: 0,   subbasin: 'baixo', anaRain: true },
+export const IPH_STATIONS: IphStation[] = [
+  // ---- Alto Sinos / Rolante (ANA, medido) ----
+  { id: 'caraa',         name: 'Caraá',                     city: 'Caraá',       anaCode: '87318700', kind: 'fluvio', lat: -29.7692, lon: -50.3572, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  { id: 'arroio-caraa',  name: 'Arroio Caraá',              city: 'Caraá',       anaCode: '87318000', kind: 'fluvio', lat: -29.7908, lon: -50.4217, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  { id: 'faz-taipas',    name: 'Fazenda Taipas',            city: 'Riozinho',    anaCode: '2950108',  kind: 'pluvio', lat: -29.4686, lon: -50.4519, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  { id: 'rol-mascarada', name: 'Rolante — Rio Mascarada',   city: 'Rolante',     anaCode: '87337010', kind: 'fluvio', lat: -29.5825, lon: -50.4697, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  { id: 'alto-rolante',  name: 'Alto Rolante',              city: 'Rolante',     anaCode: '87350000', kind: 'fluvio', lat: -29.645,  lon: -50.5106, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  { id: 'rolante',       name: 'Rolante — Centro',          city: 'Rolante',     anaCode: '87351000', kind: 'fluvio', lat: -29.6653, lon: -50.5819, subbasin: 'alto',  critical: 0,   rainFrom: 'ana' },
+  // ---- Alto Sinos (Open-Meteo no ponto, sem telemetria pública) ----
+  { id: 'riozinho',      name: 'Riozinho — Centro',         city: 'Riozinho',    anaCode: null, kind: 'pluvio', lat: -29.6406, lon: -50.4597, subbasin: 'alto',  critical: 0, rainFrom: 'om' },
+  { id: 'rol-boaesp',    name: 'Boa Esperança',             city: 'Rolante',     anaCode: null, kind: 'pluvio', lat: -29.5586, lon: -50.5025, subbasin: 'alto',  critical: 0, rainFrom: 'om' },
+  { id: 'rol-mataolho',  name: 'Mata Olho',                 city: 'Rolante',     anaCode: null, kind: 'pluvio', lat: -29.5803, lon: -50.5561, subbasin: 'alto',  critical: 0, rainFrom: 'om' },
+  { id: 'rol-rolantinho',name: 'Alto Rolantinho',           city: 'Rolante',     anaCode: null, kind: 'pluvio', lat: -29.6904, lon: -50.5498, subbasin: 'alto',  critical: 0, rainFrom: 'om' },
+  // ---- Médio Sinos / Paranhana (ANA, medido) ----
+  { id: 'tres-coroas',   name: 'Três Coroas',               city: 'Três Coroas', anaCode: '87366500', kind: 'fluvio', lat: -29.47,   lon: -50.7594, subbasin: 'medio', critical: 0,   rainFrom: 'ana' },
+  { id: 'igrejinha',     name: 'Igrejinha',                 city: 'Igrejinha',   anaCode: '87375500', kind: 'fluvio', lat: -29.5736, lon: -50.7964, subbasin: 'medio', critical: 0,   rainFrom: 'ana' },
+  { id: 'taquara',       name: 'Taquara (Foz Paranhana)',   city: 'Taquara',     anaCode: '87376000', kind: 'fluvio', lat: -29.6858, lon: -50.8122, subbasin: 'medio', critical: 5.9, rainFrom: 'ana', routeId: 'taquara' },
+  // ---- Médio Sinos (Open-Meteo no ponto) ----
+  { id: 'tc-raft',       name: 'Três Coroas — Raft Park',   city: 'Três Coroas', anaCode: null, kind: 'pluvio', lat: -29.4253, lon: -50.7719, subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'tc-ctr',        name: 'Três Coroas — Centro',      city: 'Três Coroas', anaCode: null, kind: 'pluvio', lat: -29.515,  lon: -50.775,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'tc-vp',         name: 'Três Coroas — V. Pinheiros',city: 'Três Coroas', anaCode: null, kind: 'pluvio', lat: -29.5161, lon: -50.8031, subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'ig-fig2',       name: 'Igrejinha — Figueira II',   city: 'Igrejinha',   anaCode: null, kind: 'pluvio', lat: -29.54,   lon: -50.781,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'ig-fig',        name: 'Igrejinha — Figueira',      city: 'Igrejinha',   anaCode: null, kind: 'pluvio', lat: -29.555,  lon: -50.789,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'ig-bp',         name: 'Igrejinha — Bom Pastor',    city: 'Igrejinha',   anaCode: null, kind: 'pluvio', lat: -29.569,  lon: -50.807,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'ig-xv',         name: 'Igrejinha — XV de Novembro',city: 'Igrejinha',   anaCode: null, kind: 'pluvio', lat: -29.589,  lon: -50.804,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'parobe-inv',    name: 'Parobé — Invernada',        city: 'Parobé',      anaCode: null, kind: 'pluvio', lat: -29.601,  lon: -50.821,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  { id: 'parobe-paraiso',name: 'Parobé — Paraíso',          city: 'Parobé',      anaCode: null, kind: 'pluvio', lat: -29.629,  lon: -50.815,  subbasin: 'medio', critical: 0, rainFrom: 'om' },
+  // ---- Baixo Sinos até Campo Bom (ANA, medido) ----
+  { id: 'nova-hartz',    name: 'Nova Hartz',                city: 'Nova Hartz',  anaCode: '87377400', kind: 'fluvio', lat: -29.5933, lon: -50.9028, subbasin: 'baixo', critical: 0,   rainFrom: 'ana' },
+  { id: 'ararica',       name: 'Araricá',                   city: 'Araricá',     anaCode: '87377500', kind: 'fluvio', lat: -29.6908, lon: -50.9417, subbasin: 'baixo', critical: 0,   rainFrom: 'ana', routeId: 'ararica' },
+  { id: 'campo-bom',     name: 'Campo Bom',                 city: 'Campo Bom',   anaCode: '87380000', kind: 'pluvio', lat: -29.6917, lon: -51.0461, subbasin: 'baixo', critical: 0,   rainFrom: 'ana' },
+  // ---- Baixo Sinos (Open-Meteo no ponto) ----
+  { id: 'sapiranga',     name: 'Sapiranga (Toca)',          city: 'Sapiranga',   anaCode: null, kind: 'pluvio', lat: -29.6333, lon: -51.0,    subbasin: 'baixo', critical: 0, rainFrom: 'om' },
+  { id: 'cb-quatrocol',  name: 'Campo Bom — Quatro Colônias',city: 'Campo Bom',  anaCode: null, kind: 'pluvio', lat: -29.664,  lon: -51.035,  subbasin: 'baixo', critical: 0, rainFrom: 'om' },
+  { id: 'cb-bairrok',    name: 'Campo Bom — Bairro K',      city: 'Campo Bom',   anaCode: null, kind: 'pluvio', lat: -29.683,  lon: -51.047,  subbasin: 'baixo', critical: 0, rainFrom: 'om' },
+  { id: 'cb-barrinha',   name: 'Campo Bom — Barrinha',      city: 'Campo Bom',   anaCode: null, kind: 'pluvio', lat: -29.695,  lon: -51.042,  subbasin: 'baixo', critical: 0, rainFrom: 'om' },
 ];
 
-/** Coordenada de Campo Bom (ponto focal para IDW). */
-const CB = { lat: -29.6917, lon: -51.0461 };
+/** Centróides aproximados das sub-bacias — pontos da previsão ECMWF/GFS. */
+export const SUB_CENTROIDS: Record<Sub, { lat: number; lon: number }> = {
+  alto: { lat: -29.66, lon: -50.45 },
+  medio: { lat: -29.52, lon: -50.78 },
+  baixo: { lat: -29.66, lon: -50.95 },
+};
 
 /* ================================================================== */
 /* Tipos de saída                                                      */
@@ -169,9 +236,29 @@ export interface StationSnap {
   p6: number; p12: number; p24: number; p48: number;
   api: number;
   pEfetiva: number;
-  idwWeight: number;
+  /** entrou na média areal da sua sub-bacia */
+  inAreal: boolean;
   /** fonte da chuva: 'ANA' (medido), 'Open-Meteo' (modelo) ou 'sem dados' (fonte indisponível) */
   rainSource: 'ANA' | 'Open-Meteo' | 'sem dados';
+}
+
+/** Estação fluviométrica a montante — nível, tendência e papel no guia. */
+export interface UpstreamSnap {
+  id: string;
+  name: string;
+  subbasin: Sub;
+  level: number | null;
+  /** taxa atual (cm/h, média das últimas 3 h) */
+  rateCmH: number | null;
+  /** hora da última leitura */
+  lastTs: number | null;
+  /** entra no guia de taxa (roteamento calibrado) */
+  inGuide: boolean;
+  lagH: number | null;
+  kH: number | null;
+  gain: number | null;
+  /** motivo quando não entra no guia */
+  note: string;
 }
 
 export interface HorizonForecast {
@@ -239,6 +326,12 @@ export interface IphOutput {
     ecmwfRainMm: number;
     gfsRainMm: number;
   };
+  /** Estações fluviométricas a montante (monitoramento + guia de taxa). */
+  upstream: UpstreamSnap[];
+  /** Guia de taxa: até que hora a previsão é "já medida" a montante. */
+  guide: { horizonH: number; sources: string[] };
+  /** Chuva média areal por sub-bacia (fonte e estações usadas). */
+  subRain: SubRain[];
   /** Verificação da calibração com o evento de referência (maio/2024),
    *  medida no próprio motor (pico da curva projetada). */
   calibration: { peakRiseM: number; observedRiseM: number; rainMm: number; deltaM: number };
@@ -258,21 +351,6 @@ export { GAMMA, computeApi };
 /** Chuva efetiva acumulada (mm) no evento, para exibição nas estações. */
 function effectiveRainEvent(pCumMm: number, api: number, sub: string): number {
   return +eventRunoffMm(pCumMm, cnForSub(sub, api)).toFixed(1);
-}
-
-/** Distância em km (Haversine simplificada). */
-function distKm(aLat: number, aLon: number, bLat: number, bLon: number): number {
-  const dx = (bLon - aLon) * 111.32 * Math.cos(((aLat + bLat) / 2) * Math.PI / 180);
-  const dy = (bLat - aLat) * 110.54;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-/** Calcula pesos IDW para as estações em relação a Campo Bom. */
-function idwWeights(stations: IphStation[]): number[] {
-  const dists = stations.map((s) => Math.max(0.5, distKm(CB.lat, CB.lon, s.lat, s.lon)));
-  const inv = dists.map((d) => 1 / (d * d));
-  const sum = inv.reduce((a, v) => a + v, 0) || 1;
-  return inv.map((v) => +(v / sum).toFixed(4));
 }
 
 function sumLast(h: number[], n: number): number {
@@ -309,9 +387,11 @@ async function fetchJson(url: string): Promise<any> {
 interface AnaSeries {
   /** leituras de nível (m), ordenadas */
   levels: { ts: number; h: number }[];
-  /** chuva horária agregada (mm); índice 0 = hora mais antiga */
-  rainHourly: number[];
+  /** chuva por hora cheia (chave = ts da hora, ms) — só horas com registro */
+  rainByHour: Map<number, number>;
 }
+
+const EMPTY_SERIES = (): AnaSeries => ({ levels: [], rainByHour: new Map() });
 
 function childText(el: Element | null, tag: string): string | null {
   if (!el) return null;
@@ -336,7 +416,7 @@ function childText(el: Element | null, tag: string): string | null {
  */
 function parseAnaXml(code: string, xml: string): AnaSeries {
   const doc = new DOMParser().parseFromString(xml, 'text/xml');
-  if (doc.getElementsByTagName('parsererror').length) return { levels: [], rainHourly: [] };
+  if (doc.getElementsByTagName('parsererror').length) return EMPTY_SERIES();
 
   const num = (t: string | null): number | null => {
     if (t == null) return null;
@@ -372,17 +452,14 @@ function parseAnaXml(code: string, xml: string): AnaSeries {
     levels.push({ ts: r.ts, h: +(r.nivelCm / 100).toFixed(2) });
   }
 
-  let rainHourly: number[] = [];
-  const rainRecs = recs.filter((r) => r.chuvaMm != null);
-  if (rainRecs.length) {
-    const firstHour = Math.floor(rainRecs[0].ts / 3600000);
-    const lastHour = Math.floor(rainRecs[rainRecs.length - 1].ts / 3600000);
-    rainHourly = new Array(lastHour - firstHour + 1).fill(0);
-    for (const r of rainRecs) rainHourly[Math.floor(r.ts / 3600000) - firstHour] += r.chuvaMm || 0;
-    rainHourly = rainHourly.map((v) => +v.toFixed(1));
+  const rainByHour = new Map<number, number>();
+  for (const r of recs) {
+    if (r.chuvaMm == null || r.chuvaMm < 0) continue;
+    const k = Math.floor(r.ts / 3600000) * 3600000;
+    rainByHour.set(k, (rainByHour.get(k) ?? 0) + r.chuvaMm);
   }
 
-  return { levels, rainHourly };
+  return { levels, rainByHour };
 }
 
 function levelAt(series: { ts: number; h: number }[], t: number): number | null {
@@ -412,11 +489,27 @@ function dH(series: { ts: number; h: number }[], end: number, hours: number): nu
 }
 
 /**
- * Busca telemetria da ANA (nível + chuva) em UM único fetch por estação —
- * antes havia um fetch para nível e outro para chuva do mesmo período.
- * O retorno é XML (diffgram); veja parseAnaXml.
+ * Busca telemetria da ANA (nível + chuva) em UM único fetch por estação.
+ * 1) backend próprio `/api/ana/serie` (sem CORS, cache de 10 min, reserva
+ *    stale, lista fechada de códigos da bacia);
+ * 2) contingência: proxies públicos + parser XML.
  */
 async function fetchAnaData(code: string, days: number): Promise<AnaSeries> {
+  try {
+    const json = await fetchJson(`/api/ana/serie?codEstacao=${code}&days=${days}`);
+    const levels: { ts: number; h: number }[] = [];
+    for (const r of (json?.readings ?? []) as { ts: number; level: number }[]) {
+      if (Number.isFinite(r.ts) && Number.isFinite(r.level) && r.level > 0) levels.push({ ts: r.ts, h: r.level });
+    }
+    const rainByHour = new Map<number, number>();
+    for (const r of (json?.rain ?? []) as { ts: number; mm: number }[]) {
+      if (!Number.isFinite(r.ts) || !Number.isFinite(r.mm) || r.mm < 0) continue;
+      const k = Math.floor(r.ts / 3600000) * 3600000;
+      rainByHour.set(k, (rainByHour.get(k) ?? 0) + r.mm);
+    }
+    if (levels.length || rainByHour.size) return { levels, rainByHour };
+  } catch { /* segue para os proxies */ }
+
   const now = new Date();
   const start = new Date(now.getTime() - days * 86400000);
   const end = new Date(now.getTime() + 86400000);
@@ -429,10 +522,10 @@ async function fetchAnaData(code: string, days: number): Promise<AnaSeries> {
     try {
       const xml = await fetchText(u);
       const s = parseAnaXml(code, xml);
-      if (s.levels.length || s.rainHourly.length) return s;
+      if (s.levels.length || s.rainByHour.size) return s;
     } catch { /* tenta o próximo proxy */ }
   }
-  return { levels: [], rainHourly: [] };
+  return EMPTY_SERIES();
 }
 
 function parseOmHour(iso: string): number {
@@ -442,21 +535,16 @@ function parseOmHour(iso: string): number {
 }
 
 
-interface RainPack {
-  past: Record<string, number[]>;
-  /** chuva prevista média da bacia: passado recente (24 h) + futuro (80 h).
-   *  Índice 0 = 24 h atrás de agora, índice 24 = agora, índice 25+ = futuro. */
-  ecmwf: number[];
-  gfs: number[];
-}
-
 /**
- * Monta array contínuo passado+futuro a partir de uma resposta Open-Meteo.
- * RAIN_PAST_H horas de passado + RAIN_FUT_H de futuro.
- * Índice RAIN_PAST_H = agora (t=0).
+ * Arrays contínuos passado+futuro: RAIN_PAST_H horas de passado +
+ * RAIN_FUT_H de futuro. Índice RAIN_PAST_H = agora (t=0).
  */
 const RAIN_FUT_H = 100;
 const RAIN_TL_LEN = RAIN_PAST_H + RAIN_FUT_H;
+/** horas de histórico de chuva (API usa 14 dias) */
+const RAIN_HIST_H = 14 * 24;
+/** estação ANA "válida" para a média se tiver registro nas últimas N horas */
+const ANA_FRESH_H = 6;
 
 function buildRainTimeline(times: string[], values: number[], now: number): number[] {
   const out: number[] = new Array(RAIN_TL_LEN).fill(0);
@@ -469,61 +557,163 @@ function buildRainTimeline(times: string[], values: number[], now: number): numb
   return out;
 }
 
+/** Série horária de RAIN_HIST_H horas terminando na hora de `now` (último índice). */
+function hourlyFromMap(m: Map<number, number>, now: number): number[] {
+  const endH = Math.floor(now / 3600000) * 3600000;
+  const out = new Array(RAIN_HIST_H).fill(0);
+  for (let i = 0; i < RAIN_HIST_H; i++) out[i] = +(m.get(endH - (RAIN_HIST_H - 1 - i) * 3600000) ?? 0).toFixed(2);
+  return out;
+}
+
+function hourlyFromOm(block: any, now: number): number[] | null {
+  const times = (block?.hourly?.time as string[]) ?? [];
+  const vals = (block?.hourly?.precipitation as number[]) ?? [];
+  if (!times.length) return null;
+  const m = new Map<number, number>();
+  for (let i = 0; i < times.length; i++) {
+    const ts = parseOmHour(times[i]);
+    if (Number.isFinite(ts) && ts <= now) m.set(Math.floor(ts / 3600000) * 3600000, Number(vals[i]) || 0);
+  }
+  return m.size ? hourlyFromMap(m, now) : null;
+}
+
+export interface SubRain {
+  sub: Sub;
+  /** fonte da média areal: 'ANA' (pluviômetros medidos) | 'Open-Meteo' | 'sem dados' */
+  source: 'ANA' | 'Open-Meteo' | 'sem dados';
+  /** ids das estações que entraram na média */
+  stations: string[];
+  p24: number;
+  p48: number;
+  api: number;
+}
+
+interface RainPack {
+  /** chuva horária por estação (RAIN_HIST_H h, último índice = agora); ausente = sem dados */
+  past: Record<string, number[]>;
+  /** fonte efetiva por estação */
+  srcOf: Record<string, 'ANA' | 'Open-Meteo'>;
+  /** média areal por sub-bacia (RAIN_HIST_H h) — null = sem dados */
+  subPast: Record<Sub, number[] | null>;
+  subInfo: SubRain[];
+  /** previsão por sub-bacia (centróide), passado recente + futuro */
+  ecmwfBySub: Record<Sub, number[]>;
+  gfsBySub: Record<Sub, number[]>;
+  /** média da bacia ponderada por área (compatibilidade: curva/backtest/painel) */
+  ecmwf: number[];
+  gfs: number[];
+  /** níveis das estações fluviométricas (id → série) */
+  levels: Record<string, { ts: number; h: number }[]>;
+}
+
+const SUBS: Sub[] = ['alto', 'medio', 'baixo'];
+
+function areaMean(bySub: Record<Sub, number[] | null>, len: number): number[] | null {
+  let wsum = 0;
+  const out = new Array(len).fill(0);
+  for (const sub of SUBS) {
+    const arr = bySub[sub];
+    if (!arr) continue;
+    wsum += SUB_AREA_FRAC[sub];
+    for (let i = 0; i < len; i++) out[i] += (arr[i] ?? 0) * SUB_AREA_FRAC[sub];
+  }
+  return wsum > 0 ? out.map((v) => +(v / wsum).toFixed(2)) : null;
+}
+
 /**
- * Busca chuva das estações + previsão meteorológica.
- * A previsão ECMWF/GFS é buscada como MÉDIA das coordenadas das estações
- * a montante (não só Campo Bom), para capturar a chuva nas cabeceiras.
+ * Busca a chuva de TODAS as estações da bacia + nível das fluviométricas +
+ * previsão ECMWF/GFS nos centróides das 3 sub-bacias.
+ *
+ * Média areal por sub-bacia (hydrologic-modeling-engine: precipitação média
+ * da bacia): se a sub-bacia tem ≥ 1 pluviômetro ANA transmitindo, usa a
+ * média dos pluviômetros ANA (medido); senão, a média dos pontos Open-Meteo
+ * da sub-bacia (modelo). A antiga ponderação IDW centrada em Campo Bom dava
+ * peso ~0 às cabeceiras — justamente onde nasce a cheia.
  */
 async function fetchRainPack(now: number): Promise<RainPack> {
-  const omStations = IPH_STATIONS.filter((s) => !s.anaRain);
-  const lats = omStations.map((s) => s.lat).join(',');
-  const lons = omStations.map((s) => s.lon).join(',');
-  const anaStations = IPH_STATIONS.filter((s) => s.anaRain);
-
-  // coordenadas médias da bacia para a previsão meteorológica
-  const allLats = IPH_STATIONS.map((s) => s.lat);
-  const allLons = IPH_STATIONS.map((s) => s.lon);
-  const fcLat = (allLats.reduce((a, v) => a + v, 0) / allLats.length).toFixed(4);
-  const fcLon = (allLons.reduce((a, v) => a + v, 0) / allLons.length).toFixed(4);
+  const omStations = IPH_STATIONS.filter((s) => s.rainFrom === 'om');
+  const anaStations = IPH_STATIONS.filter((s) => s.anaCode);
+  const om = (model: string, fallback: string) => {
+    const lats = SUBS.map((k) => SUB_CENTROIDS[k].lat).join(',');
+    const lons = SUBS.map((k) => SUB_CENTROIDS[k].lon).join(',');
+    const u = (m: string) =>
+      `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation&models=${m}&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`;
+    return fetchJson(u(model)).catch(() => fetchJson(u(fallback))).catch(() => null);
+  };
 
   const [hist, ecm, gfs, ...anaResults] = await Promise.all([
-    lats
-      ? fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation&past_days=14&forecast_days=1&timezone=America%2FSao_Paulo`)
-          .catch(() => null)
+    omStations.length
+      ? fetchJson(
+          `https://api.open-meteo.com/v1/forecast?latitude=${omStations.map((s) => s.lat).join(',')}&longitude=${omStations.map((s) => s.lon).join(',')}&hourly=precipitation&past_days=14&forecast_days=1&timezone=America%2FSao_Paulo`
+        ).catch(() => null)
       : null,
-    fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=ecmwf_ifs025&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)
-      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=best_match&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`))
-      .catch(() => null),
-    fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=gfs_global&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)
-      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=gfs_seamless&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`))
-      .catch(() => null),
-    ...anaStations.map((s) =>
-      fetchAnaData(s.anaCode, 14).catch((): AnaSeries => ({ levels: [], rainHourly: [] }))
-    ),
+    om('ecmwf_ifs025', 'best_match'),
+    om('gfs_global', 'gfs_seamless'),
+    ...anaStations.map((s) => fetchAnaData(s.anaCode as string, 14).catch(EMPTY_SERIES)),
   ]);
 
   const past: Record<string, number[]> = {};
+  const srcOf: Record<string, 'ANA' | 'Open-Meteo'> = {};
+  const levels: Record<string, { ts: number; h: number }[]> = {};
   if (hist) {
     const list = Array.isArray(hist) ? hist : [hist];
-    list.forEach((b: any, i: number) => {
-      if (omStations[i]) past[omStations[i].id] = (b?.hourly?.precipitation as number[]) ?? [];
+    list.forEach((blk: any, i: number) => {
+      const st = omStations[i];
+      const arr = st ? hourlyFromOm(blk, now) : null;
+      if (st && arr) { past[st.id] = arr; srcOf[st.id] = 'Open-Meteo'; }
     });
   }
+  const freshAna = new Set<string>();
   anaResults.forEach((data: AnaSeries, i: number) => {
-    if (anaStations[i] && data.rainHourly.length > 0) past[anaStations[i].id] = data.rainHourly;
+    const st = anaStations[i];
+    if (!st) return;
+    if (data.levels.length) levels[st.id] = data.levels;
+    if (st.rainFrom === 'ana' && data.rainByHour.size) {
+      past[st.id] = hourlyFromMap(data.rainByHour, now);
+      srcOf[st.id] = 'ANA';
+      const lastRec = Math.max(...data.rainByHour.keys());
+      if (now - lastRec <= ANA_FRESH_H * 3600000) freshAna.add(st.id);
+    }
   });
 
-  const ecmTimes = (ecm?.hourly?.time as string[]) ?? [];
-  const gfsTimes = (gfs?.hourly?.time as string[]) ?? [];
+  const subPast = { alto: null, medio: null, baixo: null } as Record<Sub, number[] | null>;
+  const subInfo: SubRain[] = [];
+  for (const sub of SUBS) {
+    const inSub = IPH_STATIONS.filter((s) => s.subbasin === sub);
+    let used = inSub.filter((s) => srcOf[s.id] === 'ANA' && freshAna.has(s.id));
+    let source: SubRain['source'] = 'ANA';
+    if (!used.length) { used = inSub.filter((s) => srcOf[s.id] === 'Open-Meteo'); source = 'Open-Meteo'; }
+    if (!used.length) { subInfo.push({ sub, source: 'sem dados', stations: [], p24: 0, p48: 0, api: 0 }); continue; }
+    const mean = new Array(RAIN_HIST_H).fill(0);
+    for (const s of used) past[s.id].forEach((v, i) => { mean[i] += v / used.length; });
+    subPast[sub] = mean.map((v) => +v.toFixed(2));
+    subInfo.push({ sub, source, stations: used.map((s) => s.id), p24: sumLast(mean, 24), p48: sumLast(mean, 48), api: computeApi(mean) });
+  }
+
+  const fcBlock = (j: any, i: number) => {
+    const list = Array.isArray(j) ? j : j ? [j] : [];
+    const b = list[i] ?? list[0];
+    return buildRainTimeline((b?.hourly?.time as string[]) ?? [], (b?.hourly?.precipitation as number[]) ?? [], now);
+  };
+  const ecmwfBySub = {} as Record<Sub, number[]>;
+  const gfsBySub = {} as Record<Sub, number[]>;
+  SUBS.forEach((sub, i) => {
+    const e = fcBlock(ecm, i);
+    const g = fcBlock(gfs, i);
+    // passado (índices < RAIN_PAST_H): chuva MEDIDA da sub-bacia quando há —
+    // a "previsão" do passado é só a análise do modelo
+    const sp = subPast[sub];
+    if (sp) for (let k = 0; k < RAIN_PAST_H; k++) { const v = sp[RAIN_HIST_H - RAIN_PAST_H + k]; e[k] = v; g[k] = v; }
+    ecmwfBySub[sub] = e;
+    gfsBySub[sub] = g;
+  });
 
   return {
-    past,
-    ecmwf: buildRainTimeline(ecmTimes, (ecm?.hourly?.precipitation as number[]) ?? [], now),
-    gfs: buildRainTimeline(gfsTimes, (gfs?.hourly?.precipitation as number[]) ?? [], now),
+    past, srcOf, subPast, subInfo, ecmwfBySub, gfsBySub, levels,
+    ecmwf: areaMean(ecmwfBySub, RAIN_TL_LEN) ?? new Array(RAIN_TL_LEN).fill(0),
+    gfs: areaMean(gfsBySub, RAIN_TL_LEN) ?? new Array(RAIN_TL_LEN).fill(0),
   };
 }
-
-
 
 /** Chuva analisada (passado) de um modelo, com carimbo de hora — usada no
  *  backtest. O carimbo evita o erro de alinhamento por índice (o antigo
@@ -592,9 +782,8 @@ export function runBacktest(
   guaiba: number | null,
   horizonH: number,
   toleranceM: number,
-  _idwW: number[]
+  upstream: UpstreamInput[] = []
 ): BacktestResult[] {
-  void _idwW;
   const results: BacktestResult[] = [];
 
   for (const model of ['ecmwf', 'gfs'] as const) {
@@ -613,9 +802,13 @@ export function runBacktest(
       const hTarget = levelAt(campoBom, tTarget);
       if (hOrigin == null || hTarget == null) continue;
 
-      // Aproximação do backtest: usa a taxa local de 2 h (sem a mistura com
-      // Taquara) e o API/Guaíba atuais para todas as origens históricas.
-      const rate = dH(campoBom, tOrigin, 2);
+      // Mesmo caminho da previsão real: taxa local 2 h/6 h até a origem +
+      // guia das estações a montante com leituras ATÉ a origem (sem futuro).
+      // Aproximação mantida: API/Guaíba atuais para as origens históricas.
+      const cbUntil = campoBom.filter((p) => p.ts <= tOrigin);
+      const rate2 = dH(cbUntil, tOrigin, 2);
+      const rate6 = dH(cbUntil, tOrigin, 6);
+      const g = guideForCampoBom(upstream, campoBom, tOrigin, rate2, horizonH);
 
       // fatia alinhada: índice RAIN_PAST_H == tOrigin; o motor lê a chuva
       // em RAIN_PAST_H + t − lag (t = 1..horizonte), ou seja, só usa chuva
@@ -626,8 +819,10 @@ export function runBacktest(
         rainSlice[k] = rainByHour.get(tOriginHour + (k - RAIN_PAST_H) * 3600000) ?? 0;
       }
 
-      const prop = propagateCurve(hOrigin, horizonH, rate, rate, rainSlice, meanApi, guaiba);
-      const predicted = prop.stages[horizonH] ?? hOrigin;
+      const prop = propagateCurve(hOrigin, horizonH, rate6, rate2, rainSlice, meanApi, guaiba, {
+        rateGuideCmH: g.rates ?? undefined,
+      });
+      const predicted = limitDescent(prop.stages)[horizonH] ?? hOrigin;
       pairs.push({ hour: offset, predicted, observed: hTarget, errorM: +(predicted - hTarget).toFixed(3) });
       persistErrs.push(Math.abs(hOrigin - hTarget));
     }
@@ -706,14 +901,27 @@ export function runBacktest(
 /* Textos e curva                                                      */
 /* ================================================================== */
 
-function dominantFactor(stations: StationSnap[], inertial: number, rain: number, rem: number): string {
-  const tq = stations.find((s) => s.station.id === 'taquara');
+function dominantFactor(
+  upstream: UpstreamSnap[],
+  guideH: number,
+  meanApi: number,
+  inertial: number,
+  rain: number,
+  rem: number
+): string {
   if (rem > 0.05) return `Efeito de remanso do Guaíba (nível elevado a jusante impedindo o escoamento).`;
-  if (tq && tq.cr != null && tq.cr > 0 && inertial > rain) return 'Onda de cheia a montante (Taquara acima da cota crítica).';
-  if (rain > inertial && rain > 0.08) return 'Chuva efetiva na bacia (solo convertendo precipitação em escoamento).';
-  const sat = stations.reduce((a, s) => a + s.api, 0) / stations.length;
-  if (sat > 100) return 'Saturação do solo (API elevado) — chuva adicional vira vazão rapidamente.';
-  if (inertial > 0.05) return 'Propagação inercial da onda de cheia vinda de Taquara/Rolante.';
+  const tq = upstream.find((u) => u.id === 'taquara');
+  const ar = upstream.find((u) => u.id === 'ararica');
+  if (guideH > 0 && Math.abs(inertial) >= Math.abs(rain)) {
+    const parts: string[] = [];
+    if (ar?.rateCmH != null) parts.push(`Araricá ${ar.rateCmH > 0 ? '+' : ''}${ar.rateCmH.toFixed(1).replace('.', ',')} cm/h`);
+    if (tq?.rateCmH != null) parts.push(`Taquara ${tq.rateCmH > 0 ? '+' : ''}${tq.rateCmH.toFixed(1).replace('.', ',')} cm/h`);
+    const dir = inertial > 0.02 ? 'subida' : inertial < -0.02 ? 'descida' : 'estabilização';
+    return `Onda já medida a montante (${parts.join(', ')}) propagada até Campo Bom — ${dir} nas próximas ${guideH} h.`;
+  }
+  if (rain > Math.abs(inertial) && rain > 0.08) return 'Chuva efetiva na bacia (solo convertendo precipitação em escoamento).';
+  if (meanApi > 100) return 'Saturação do solo (API elevado) — chuva adicional vira vazão rapidamente.';
+  if (inertial > 0.05) return 'Tendência de subida observada em Campo Bom.';
   return 'Condições estáveis a montante; variação prevista é pequena.';
 }
 
@@ -739,7 +947,9 @@ function buildCurve(
   api: number,
   guaiba: number | null,
   ecmwf: number[],
-  gfs: number[]
+  gfs: number[],
+  optsE: PropagateOpts = {},
+  optsG: PropagateOpts = {}
 ): CurvePoint[] {
   const pts: CurvePoint[] = [];
   const from = lastObsTs - 24 * 3600000;
@@ -756,8 +966,8 @@ function buildCurve(
   }
 
   // propagar hora a hora com cada modelo de chuva
-  const propE = propagateCurve(current, 72, dH6h, dH2h, ecmwf, api, guaiba);
-  const propG = propagateCurve(current, 72, dH6h, dH2h, gfs, api, guaiba);
+  const propE = propagateCurve(current, 72, dH6h, dH2h, ecmwf, api, guaiba, optsE);
+  const propG = propagateCurve(current, 72, dH6h, dH2h, gfs, api, guaiba, optsG);
 
   // Passe final de forma (./recession): a curva projetada desce em rampa
   // convexa — nunca em degrau. A série observada NÃO passa por aqui.
@@ -860,73 +1070,92 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
   const now = campoBom[campoBom.length - 1].ts;
   const current = campoBom[campoBom.length - 1].h;
   const localRate = dH(campoBom, now, 2);
+  const localRate6 = dH(campoBom, now, 6);
 
-  // cada estação falha de forma independente: uma estação fora do ar
-  // degrada o modelo (sem remanso / sem taxa a montante), mas não derruba
-  // a curva inteira — o nível atual e a previsão de chuva continuam válidos
-  const [taquaraData, guaibaData, rain] = await Promise.all([
-    fetchAnaData('87376000', 3).catch((): AnaSeries => ({ levels: [], rainHourly: [] })),
-    // 14 dias: cobre o nível (condição de contorno) e a chuva (API) juntos
-    fetchAnaData('87450020', 14).catch((): AnaSeries => ({ levels: [], rainHourly: [] })),
+  // cada estação falha de forma independente: estação fora do ar degrada o
+  // modelo (sai do guia / da média areal), mas não derruba a curva
+  const [guaibaData, rain] = await Promise.all([
+    fetchAnaData('87450020', 3).catch(EMPTY_SERIES),
     fetchRainPack(now),
   ]);
-  const taquara = taquaraData.levels;
   const guaibaRaw = guaibaData.levels;
-  if (!taquara.length) console.warn('[iph] Taquara (87376000): sem níveis — fator a montante e taxa mista usam apenas Campo Bom.');
   if (!guaibaRaw.length) console.warn('[iph] Guaíba (87450020): sem níveis — efeito de remanso desativado nesta projeção.');
   const guaibaLevel = guaibaRaw.length ? guaibaRaw[guaibaRaw.length - 1].h : null;
-  const idwW = idwWeights(IPH_STATIONS);
 
-  const stations: StationSnap[] = IPH_STATIONS.map((st, i) => {
+  // ---- estações a montante: nível, tendência e guia de taxa ----
+  const fluvio = IPH_STATIONS.filter((s) => s.kind === 'fluvio');
+  const upstreamInput: UpstreamInput[] = fluvio
+    .filter((s) => s.routeId && rain.levels[s.id]?.length)
+    .map((s) => ({ id: s.routeId as string, name: s.name, levels: rain.levels[s.id] }));
+  const g = guideForCampoBom(upstreamInput, campoBom, now, localRate, 72);
+  const upstream: UpstreamSnap[] = fluvio.map((s) => {
+    const lv = rain.levels[s.id] ?? [];
+    const last = lv.length ? lv[lv.length - 1] : null;
+    const r = s.routeId ? g.routed.find((x) => x.id === s.routeId) : undefined;
+    const p = s.routeId ? ROUTING[s.routeId] : undefined;
+    const stale = last != null && now - last.ts > 6 * 3600000;
+    const note = r
+      ? 'no guia'
+      : p
+        ? !last ? 'sem leituras' : stale ? 'leitura com mais de 6 h' : 'sem dados suficientes'
+        : !last ? 'sem leituras' : 'monitoramento (sem calibração de propagação)';
+    return {
+      id: s.id,
+      name: s.name,
+      subbasin: s.subbasin,
+      level: last?.h ?? null,
+      rateCmH: lv.length ? dH(lv, last!.ts, 3) : null,
+      lastTs: last?.ts ?? null,
+      inGuide: !!r,
+      lagH: p?.lag ?? null,
+      kH: p?.k ?? null,
+      gain: p?.gain ?? null,
+      note,
+    };
+  });
+  for (const u of upstream) if (u.lastTs == null) console.warn(`[iph] ${u.name}: sem leituras de nível.`);
+
+  // ---- chuva: estações e média areal por sub-bacia ----
+  const stations: StationSnap[] = IPH_STATIONS.map((st) => {
     const hourly = rain.past[st.id] ?? [];
     const api = computeApi(hourly);
     const p24 = sumLast(hourly, 24);
-    // CORREÇÃO skill 09/2026: display agora usa o MESMO pipeline da propagação (CN + saturação)
-    // antes pEfetiva(p24) era só saturação sobre chuva bruta, divergindo do motor.
-    const pEff24 = (() => {
-      // P do evento ≈ acumulado de 24 h; CN ajustado pela saturação (AMC)
-      return effectiveRainEvent(p24, api, st.subbasin);
-    })();
-    const snap: StationSnap = {
+    const lv = rain.levels[st.id] ?? [];
+    const level = st.kind === 'fluvio' && lv.length ? lv[lv.length - 1].h : null;
+    return {
       station: st,
-      level: null, cr: null, dH2h: null, dH6h: null,
+      level,
+      cr: level != null && st.critical > 0 ? +(level - st.critical).toFixed(2) : null,
+      dH2h: st.kind === 'fluvio' && lv.length ? dH(lv, lv[lv.length - 1].ts, 2) : null,
+      dH6h: st.kind === 'fluvio' && lv.length ? dH(lv, lv[lv.length - 1].ts, 6) : null,
       p6: sumLast(hourly, 6), p12: sumLast(hourly, 12), p24,
-      p48: sumLast(hourly, 48), api, pEfetiva: pEff24,
-      idwWeight: idwW[i],
-      // 'sem dados' quando a fonte não respondeu — antes era marcado
-      // 'Open-Meteo' mesmo sem haver dado algum (diagnóstico enganoso)
-      rainSource:
-        st.anaRain && hourly.length > 0
-          ? 'ANA' as const
-          : hourly.length > 0
-            ? 'Open-Meteo' as const
-            : 'sem dados' as const,
+      p48: sumLast(hourly, 48), api,
+      pEfetiva: effectiveRainEvent(p24, api, st.subbasin),
+      inAreal: rain.subInfo.some((x) => x.stations.includes(st.id)),
+      rainSource: rain.srcOf[st.id] ?? 'sem dados',
     };
-    if (st.kind === 'fluvio' && taquara.length) {
-      snap.level = taquara[taquara.length - 1].h;
-      snap.cr = st.critical > 0 ? +(snap.level - st.critical).toFixed(2) : null;
-      snap.dH2h = dH(taquara, now, 2);
-      snap.dH6h = dH(taquara, now, 6);
-    }
-    return snap;
   });
-
-  for (const st of IPH_STATIONS) {
-    if (st.anaRain && !(rain.past[st.id]?.length)) {
-      console.warn(`[iph] ${st.name}: chuva ANA indisponível — API e P24 zerados para esta estação.`);
+  for (const s of stations) {
+    if (s.station.rainFrom === 'ana' && s.rainSource === 'sem dados') {
+      console.warn(`[iph] ${s.station.name}: chuva ANA indisponível — fora da média areal.`);
     }
   }
 
-  const tqRate = stations.find((s) => s.station.id === 'taquara')?.dH2h ?? null;
-  const mixRate = tqRate != null && localRate != null ? 0.4 * localRate + 0.6 * tqRate : (tqRate ?? localRate);
-  const meanApi = stations.reduce((a, s) => a + s.api * s.idwWeight, 0);
+  // API da bacia = média ponderada por área das sub-bacias com dados
+  const withApi = rain.subInfo.filter((x) => x.source !== 'sem dados');
+  const wApi = withApi.reduce((a, x) => a + SUB_AREA_FRAC[x.sub], 0);
+  const meanApi = wApi > 0 ? +(withApi.reduce((a, x) => a + x.api * SUB_AREA_FRAC[x.sub], 0) / wApi).toFixed(1) : 0;
 
-  // propagar a curva ECMWF (referência para os horizontes)
-  const localRate6 = dH(campoBom, now, 6);
-  const propRef = propagateCurve(current, 24, localRate6, mixRate, rain.ecmwf, meanApi, guaibaLevel);
+  const optsE: PropagateOpts = { rateGuideCmH: g.rates ?? undefined, rainBySub: rain.ecmwfBySub };
+  const optsG: PropagateOpts = { rateGuideCmH: g.rates ?? undefined, rainBySub: rain.gfsBySub };
+
+  // curva ECMWF de referência para os horizontes — mesmo passe final de forma
+  // da curva do gráfico (antes os cartões usavam a curva crua)
+  const propRef = propagateCurve(current, 24, localRate6, localRate, rain.ecmwf, meanApi, guaibaLevel, optsE);
+  const refStages = limitDescent(propRef.stages);
 
   const horizons: HorizonForecast[] = ([6, 12, 24] as const).map((hours) => {
-    const stage = +propRef.stages[hours].toFixed(2);
+    const stage = +refStages[hours].toFixed(2);
     const inerSum = propRef.inertials.slice(1, hours + 1).reduce((a, v) => a + v, 0);
     const rainSum = propRef.rains.slice(1, hours + 1).reduce((a, v) => a + v, 0);
     const remSum = propRef.rems.slice(1, hours + 1).reduce((a, v) => a + v, 0);
@@ -935,10 +1164,10 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
 
   const h12 = horizons[1];
   const h24 = horizons[2];
-  const factor = dominantFactor(stations, h24.inertial, h24.rain, h24.remanso);
+  const factor = dominantFactor(upstream, g.guide.horizonH, meanApi, h24.inertial, h24.rain, h24.remanso);
 
   const sumH = (arr: number[], n: number) => arr.slice(RAIN_PAST_H, RAIN_PAST_H + n).reduce((s, v) => s + (v || 0), 0);
-  const curve = buildCurve(campoBom, current, now, localRate6, mixRate, meanApi, guaibaLevel, rain.ecmwf, rain.gfs);
+  const curve = buildCurve(campoBom, current, now, localRate6, localRate, meanApi, guaibaLevel, rain.ecmwf, rain.gfs, optsE, optsG);
 
   const output: IphOutput = {
     current,
@@ -946,6 +1175,12 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
     guaibaLevel,
     horizons,
     stations,
+    upstream,
+    guide: {
+      horizonH: g.guide.horizonH,
+      sources: [...new Set(g.guide.source.filter((x): x is string => !!x))],
+    },
+    subRain: rain.subInfo,
     dominant: factor,
     boletim: boletimText(current, h12, h24, factor, guaibaLevel),
     curve,
@@ -967,13 +1202,11 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
       fetchPastModelRain('gfs_global', 4).catch(() => fetchPastModelRain('gfs_seamless', 4)),
     ]);
     output.backtest = [
-      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 6, 0.15, idwW),
-      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 12, 0.25, idwW),
-      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 24, 0.40, idwW),
+      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 6, 0.15, upstreamInput),
+      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 12, 0.25, upstreamInput),
+      ...runBacktest(campoBom, pastE, pastG, now, meanApi, guaibaLevel, 24, 0.40, upstreamInput),
     ];
   } catch (err) {
-    // degradação graciosa COM diagnóstico (o painel segue sem o quadro de
-    // validação; o console diz o motivo exato)
     console.warn('[iph] validação retrospectiva indisponível:', err instanceof Error ? err.message : err);
   }
 

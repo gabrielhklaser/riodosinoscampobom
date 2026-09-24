@@ -575,62 +575,142 @@ export default function IphForecast({ readings }: Props) {
             </div>
           )}
 
-          {/* estações */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {out.stations.map((s) => {
-              const warn = (s.cr != null && s.cr > 0) || s.p24 > 40;
-              return (
-                <div
-                  key={s.station.id}
-                  className={`rounded-xl border p-3.5 ${
-                    warn ? 'border-amber-500/30 bg-amber-500/5' : 'border-slate-800 bg-slate-950/40'
+          {/* estações fluviométricas a montante */}
+          <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3.5">
+            <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
+              <Waves className="h-3.5 w-3.5 text-teal-400" />
+              Estações a montante — nível e propagação até Campo Bom
+            </p>
+            <p className="mt-1 text-[10px] text-slate-500">
+              {out.guide.horizonH > 0 ? (
+                <>
+                  Próximas <strong className="text-teal-300">{out.guide.horizonH} h</strong> da curva vêm da onda{' '}
+                  <strong className="text-slate-300">já medida</strong> a montante (lag + reservatório linear, calibrado na
+                  cheia de 21–24/09/2026).
+                </>
+              ) : (
+                <span className="text-amber-300">
+                  ⚠️ Araricá e Taquara sem leituras recentes — curva usa só a tendência de Campo Bom e a chuva.
+                </span>
+              )}
+            </p>
+            <div className="mt-2 overflow-x-auto">
+              <table className="w-full text-left text-[11px]">
+                <thead className="text-[10px] uppercase text-slate-500">
+                  <tr>
+                    <th className="py-1 pr-2 font-medium">Estação</th>
+                    <th className="py-1 pr-2 font-medium">Sub-bacia</th>
+                    <th className="py-1 pr-2 text-right font-medium">Nível</th>
+                    <th className="py-1 pr-2 text-right font-medium">Taxa</th>
+                    <th className="py-1 pr-2 font-medium">Propagação</th>
+                    <th className="py-1 font-medium">Situação</th>
+                  </tr>
+                </thead>
+                <tbody className="text-slate-300">
+                  {out.upstream.map((u) => (
+                    <tr key={u.id} className="border-t border-slate-800/60">
+                      <td className="py-1 pr-2">{u.name}</td>
+                      <td className="py-1 pr-2 text-slate-400">{u.subbasin}</td>
+                      <td className="py-1 pr-2 text-right tabular-nums">{u.level != null ? `${n2(u.level)} m` : '—'}</td>
+                      <td
+                        className={`py-1 pr-2 text-right tabular-nums ${
+                          u.rateCmH == null ? '' : u.rateCmH > 0.3 ? 'text-orange-300' : u.rateCmH < -0.3 ? 'text-emerald-300' : ''
+                        }`}
+                      >
+                        {u.rateCmH != null ? `${u.rateCmH > 0 ? '+' : ''}${n1(u.rateCmH)} cm/h` : '—'}
+                      </td>
+                      <td className="py-1 pr-2 text-slate-400">
+                        {u.lagH != null ? `L ${u.lagH} h · K ${u.kH} h · k ${n2(u.gain ?? 0)}` : '—'}
+                      </td>
+                      <td className={`py-1 ${u.inGuide ? 'text-teal-300' : u.lastTs == null ? 'text-red-300' : 'text-slate-500'}`}>
+                        {u.note}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* chuva média areal por sub-bacia */}
+          <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {out.subRain.map((r) => (
+              <div key={r.sub} className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                <p className="flex items-center gap-1.5 text-xs font-semibold capitalize text-slate-200">
+                  <CloudRain className="h-3 w-3 text-sky-400" />
+                  {r.sub === 'medio' ? 'Médio' : r.sub} Sinos — média areal
+                </p>
+                <p
+                  className={`text-[10px] ${
+                    r.source === 'ANA' ? 'text-blue-300' : r.source === 'sem dados' ? 'text-red-300' : 'text-violet-300'
                   }`}
                 >
-                  <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
-                    {s.station.kind === 'fluvio' ? (
-                      <Waves className="h-3 w-3 text-teal-400" />
-                    ) : (
-                      <CloudRain className="h-3 w-3 text-sky-400" />
-                    )}
-                    {s.station.name}
-                  </p>
-                  <p className="text-[10px] text-slate-500">
-                    {s.station.city} · lag {s.station.lagH} h · w={s.station.weight}
-                    {' · '}
-                    <span
-                      className={
-                        s.rainSource === 'ANA'
-                          ? 'text-blue-300'
-                          : s.rainSource === 'sem dados'
-                            ? 'text-red-300'
-                            : 'text-violet-300'
-                      }
+                  {r.source === 'ANA' ? '📡 ANA medido' : r.source === 'sem dados' ? '⚠️ sem dados' : '🌐 Open-Meteo'} ·{' '}
+                  {r.stations.length} estaç{r.stations.length === 1 ? 'ão' : 'ões'}
+                </p>
+                <dl className="mt-1.5 space-y-0.5 text-[11px]">
+                  <Row k="P 24 h / 48 h" v={`${n1(r.p24)} / ${n1(r.p48)} mm`} />
+                  <Row k="API (saturação)" v={`${n1(r.api)} mm`} />
+                </dl>
+              </div>
+            ))}
+          </div>
+
+          {/* pluviômetros */}
+          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40 p-3.5">
+            <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
+              <CloudRain className="h-3.5 w-3.5 text-sky-400" />
+              Pluviometria da bacia a montante de Campo Bom ({out.stations.length} estações)
+            </p>
+            <table className="mt-2 w-full text-left text-[11px]">
+              <thead className="text-[10px] uppercase text-slate-500">
+                <tr>
+                  <th className="py-1 pr-2 font-medium">Estação</th>
+                  <th className="py-1 pr-2 font-medium">Sub-bacia</th>
+                  <th className="py-1 pr-2 font-medium">Fonte</th>
+                  <th className="py-1 pr-2 text-right font-medium">P 24 h</th>
+                  <th className="py-1 pr-2 text-right font-medium">P 48 h</th>
+                  <th className="py-1 pr-2 text-right font-medium">API</th>
+                  <th className="py-1 font-medium">Na média</th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-300">
+                {out.stations.map((s) => (
+                  <tr key={s.station.id} className={`border-t border-slate-800/60 ${s.p24 > 40 ? 'text-amber-200' : ''}`}>
+                    <td className="py-1 pr-2">
+                      {s.station.name}
+                      {s.station.anaCode && <span className="ml-1 text-[9px] text-slate-500">{s.station.anaCode}</span>}
+                    </td>
+                    <td className="py-1 pr-2 text-slate-400">{s.station.subbasin}</td>
+                    <td
+                      className={`py-1 pr-2 ${
+                        s.rainSource === 'ANA' ? 'text-blue-300' : s.rainSource === 'sem dados' ? 'text-red-300' : 'text-violet-300'
+                      }`}
                     >
-                      {s.rainSource === 'ANA' ? '📡 ANA medido' : s.rainSource === 'sem dados' ? '⚠️ sem dados' : '🌐 Open-Meteo'}
-                    </span>
-                  </p>
-                  <dl className="mt-2 space-y-1 text-[11px]">
-                    {s.level != null && (
-                      <Row k="Nível / CR" v={`${n2(s.level)} m · ${s.cr != null ? (s.cr > 0 ? '+' : '') + n2(s.cr) : '—'} m`} />
-                    )}
-                    {s.dH2h != null && (
-                      <Row k="dH/dt 2 h" v={`${s.dH2h > 0 ? '+' : ''}${n1(s.dH2h)} cm/h`} />
-                    )}
-                    <Row k="P 24 h / efetiva" v={`${n1(s.p24)} / ${n1(s.pEfetiva)} mm`} />
-                    <Row k="API (saturação)" v={`${n1(s.api)} mm`} />
-                  </dl>
-                </div>
-              );
-            })}
+                      {s.rainSource === 'ANA' ? '📡 ANA' : s.rainSource === 'sem dados' ? '⚠️ sem dados' : '🌐 Open-Meteo'}
+                    </td>
+                    <td className="py-1 pr-2 text-right tabular-nums">{s.rainSource === 'sem dados' ? '—' : `${n1(s.p24)} mm`}</td>
+                    <td className="py-1 pr-2 text-right tabular-nums">{s.rainSource === 'sem dados' ? '—' : `${n1(s.p48)} mm`}</td>
+                    <td className="py-1 pr-2 text-right tabular-nums">{s.rainSource === 'sem dados' ? '—' : `${n1(s.api)}`}</td>
+                    <td className="py-1 text-slate-400">{s.inAreal ? '✓' : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
 
           <p className="mt-4 border-t border-slate-800 pt-4 text-[10px] leading-relaxed text-slate-500">
             <strong className="text-slate-400">Arquitetura:</strong> propagação hora a hora acumulativa.
-            H<sub>CB</sub>(t+1) = H<sub>CB</sub>(t) + inércia(dH/dt) + Σ<sub>sub</sub> chuva_efetiva(t−lag)×coef. +
-            escoam. base + remanso(Guaíba) − recessão K·(H−H_base).
-            3 sub-bacias: alto (CN 65, lag 18 h) · médio (CN 72, lag 10 h) · baixo (CN 84, lag 4 h).
-            Chuva passada (48 h) + futura (100 h) com defasagem por sub-bacia.
-            Interpolação IDW. API diário (γ=0,87) com ajuste contínuo de umidade antecedente (AMC I/II/III,
+            H<sub>CB</sub>(t+1) = H<sub>CB</sub>(t) + taxa(t) + Σ<sub>sub</sub> chuva_efetiva(t−lag)×coef. +
+            escoam. base + remanso(Guaíba) − recessão K·(H−H_base)·(1−p(t)).
+            <strong className="text-teal-300"> taxa(t) nas primeiras horas = onda já medida a montante</strong>{' '}
+            (Araricá L 3 h; Taquara L 26 h + reservatório K 18 h, calibrados na cheia de 21–24/09/2026: erro em +24 h
+            caiu de 0,49 m para 0,04 m RMSE). A recessão só age sobre a fração da taxa que não é observada
+            (antes era somada à tendência observada e fazia o modelo prever descida com o rio subindo).
+            3 sub-bacias: alto (CN 65, lag 18 h) · médio (CN 72, lag 10 h) · baixo (CN 84, lag 4 h), com chuva
+            média areal por sub-bacia (pluviômetros ANA medidos; Open-Meteo onde não há telemetria).
+            Chuva passada (48 h, medida) + futura (100 h, ECMWF/GFS no centróide de cada sub-bacia).
+            API diário (γ=0,87) com ajuste contínuo de umidade antecedente (AMC I/II/III,
             stormwater-management SK-004). <strong className="text-slate-400">SCS-CN aplicado ao acumulado do
             evento</strong> (S=25400/CN−254, hydrologic-modeling-engine CIV-SK-022) — a versão anterior aplicava o
             CN hora a hora e a abstração inicial zerava a chuva prevista, o que fazia ECMWF e GFS desenharem a
@@ -644,7 +724,7 @@ export default function IphForecast({ readings }: Props) {
             Calibração verificada por teste (npm run test:modelo): evento de maio/2024 (102,5 mm/48 h, solo
             saturado) eleva <strong className="text-emerald-300">{n2(out.calibration.peakRiseM)} m</strong> no pico
             contra <strong className="text-slate-300">+{n2(out.calibration.observedRiseM)} m observados</strong>.
-            Estações: {IPH_STATIONS.map((s) => s.name).join(', ')}.
+            Estações ({IPH_STATIONS.length}): {IPH_STATIONS.map((s) => s.name).join(', ')}.
           </p>
         </>
       )}

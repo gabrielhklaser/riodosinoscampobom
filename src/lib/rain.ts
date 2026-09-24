@@ -321,7 +321,13 @@ async function fetchAnaRain(code: string, days: number): Promise<Record<number, 
       signal: AbortSignal.timeout(20000),
     });
     if (res.ok) {
-      const json = (await res.json()) as { readings?: Reading[] };
+      const json = (await res.json()) as { readings?: Reading[]; rain?: { ts: number; mm: number }[] };
+      // `rain` inclui pluviômetros sem régua (registros só de chuva)
+      if (Array.isArray(json.rain) && json.rain.length) {
+        const out: Record<number, number> = {};
+        for (const r of json.rain) out[hourKey(r.ts)] = (out[hourKey(r.ts)] || 0) + (r.mm || 0);
+        return out;
+      }
       return anaHourly(json.readings ?? []);
     }
   } catch {
