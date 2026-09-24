@@ -62,7 +62,14 @@ import { CALIBRATION_2024, eventRunoffMm } from './rainRunoff';
 import { limitDescent, robustRateCmH } from './recession';
 // Motor de propagação (módulo puro, coberto por scripts/test-modelo.mjs) e
 // as constantes que ele compartilha com este arquivo.
-import { API_SAT_REF, RAIN_PAST_H, cnForSub, propagateCurve } from './iphEngine';
+import {
+  API_SAT_REF,
+  GAMMA,
+  RAIN_PAST_H,
+  cnForSub,
+  computeApi,
+  propagateCurve,
+} from './iphEngine';
 
 /* ================================================================== */
 /* Classificação de risco                                              */
@@ -241,15 +248,12 @@ export interface IphOutput {
 /* Hidrologia                                                          */
 /* ================================================================== */
 
-/** γ — decaimento diário de umidade do solo */
-const GAMMA = 0.87;
-
 /* API de saturação de referência da bacia (mm) — escala do ajuste AMC do CN.
  *  Vem de ./iphEngine (fonte única com o motor). A diferenciação por
  *  sub-bacia agora sai do próprio CN (84 no baixo Sinos urbano contra 65 na
  *  serra), em vez do expoente ETA duplicado que existia aqui. */
 
-/**
+export { GAMMA, computeApi };
 
 /** Chuva efetiva acumulada (mm) no evento, para exibição nas estações. */
 function effectiveRainEvent(pCumMm: number, api: number, sub: string): number {
@@ -485,11 +489,14 @@ async function fetchRainPack(now: number): Promise<RainPack> {
   const [hist, ecm, gfs, ...anaResults] = await Promise.all([
     lats
       ? fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation&past_days=14&forecast_days=1&timezone=America%2FSao_Paulo`)
+          .catch(() => null)
       : null,
     fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=ecmwf_ifs025&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)
-      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=best_match&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)),
+      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=best_match&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`))
+      .catch(() => null),
     fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=gfs_global&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)
-      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=gfs_seamless&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`)),
+      .catch(() => fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${fcLat}&longitude=${fcLon}&hourly=precipitation&models=gfs_seamless&past_days=3&forecast_days=5&timezone=America%2FSao_Paulo`))
+      .catch(() => null),
     ...anaStations.map((s) =>
       fetchAnaData(s.anaCode, 14).catch((): AnaSeries => ({ levels: [], rainHourly: [] }))
     ),
@@ -742,7 +749,11 @@ function buildCurve(
     if (bucket === lastBucket) pts[pts.length - 1] = { ts: o.ts, observed: o.h, ecmwf: null, gfs: null, rainEcmwf: 0, rainGfs: 0 };
     else { pts.push({ ts: o.ts, observed: o.h, ecmwf: null, gfs: null, rainEcmwf: 0, rainGfs: 0 }); lastBucket = bucket; }
   }
-  pts.push({ ts: lastObsTs, observed: current, ecmwf: current, gfs: current, rainEcmwf: 0, rainGfs: 0 });
+  if (pts.length && pts[pts.length - 1].ts === lastObsTs) {
+    pts[pts.length - 1] = { ts: lastObsTs, observed: current, ecmwf: current, gfs: current, rainEcmwf: 0, rainGfs: 0 };
+  } else {
+    pts.push({ ts: lastObsTs, observed: current, ecmwf: current, gfs: current, rainEcmwf: 0, rainGfs: 0 });
+  }
 
   // propagar hora a hora com cada modelo de chuva
   const propE = propagateCurve(current, 72, dH6h, dH2h, ecmwf, api, guaiba);

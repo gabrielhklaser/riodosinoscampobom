@@ -81,6 +81,25 @@ export function saturationFromApi(api: number): number {
   return Math.min(1, Math.max(0, (Number(api) || 0) / API_SAT_REF));
 }
 
+/** γ — decaimento diário de umidade do solo (Antecedent Precipitation Index). */
+export const GAMMA = 0.87;
+
+/**
+ * API (Antecedent Precipitation Index) a partir de série horária (mm).
+ * API_d = P_d + γ · API_{d-1}
+ * Acumula o índice dia a dia com decaimento diário de umidade.
+ */
+export function computeApi(hourly: number[]): number {
+  if (!hourly || !hourly.length) return 0;
+  const days = Math.ceil(hourly.length / 24);
+  let api = 0;
+  for (let d = 0; d < days; d++) {
+    const p = hourly.slice(d * 24, d * 24 + 24).reduce((s, v) => s + (v || 0), 0);
+    api = p + GAMMA * api;
+  }
+  return +api.toFixed(1);
+}
+
 /**
  * CN efetivo da sub-bacia já ajustado à umidade antecedente (AMC).
  * Substitui a dupla conversão CN→Q→saturação da revisão anterior: o ajuste

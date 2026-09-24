@@ -196,6 +196,8 @@ import {
   SUB_AREA_FRAC,
   SUB_DH,
   API_SAT_REF,
+  computeApi,
+  GAMMA,
 } from '../src/lib/iphEngine.ts';
 
 const API_SATURADO = API_SAT_REF; // solo saturado (AMC III)
@@ -275,3 +277,29 @@ test('motor: ganhos da calibração são os mesmos usados no painel', () => {
   assert.ok(Math.abs(soma - 1) < 1e-9, 'frações de área somam 1');
   assert.ok(SUB_DH.baixo > SUB_DH.alto, 'baixo Sinos (urbano) responde mais que a serra');
 });
+
+test('hidrologia: computeApi calcula o índice antecedente com decaimento diário', () => {
+  assert.equal(computeApi([]), 0, 'array vazio resulta em API zero');
+  assert.equal(computeApi(null), 0, 'nulo resulta em API zero');
+
+  // 1 dia de chuva constante (1 mm/h = 24 mm)
+  const d1 = new Array(24).fill(1);
+  assert.equal(computeApi(d1), 24, '1 dia com 24 mm dá API = 24 mm');
+
+  // 2 dias: dia 1 com 20 mm, dia 2 seco (0 mm) -> API = 0 + 0.87 * 20 = 17.4 mm
+  const d2 = [...new Array(24).fill(20 / 24), ...new Array(24).fill(0)];
+  const esperado = +(GAMMA * 20).toFixed(1);
+  assert.equal(computeApi(d2), esperado, `2 dias com dia seco após 20 mm dá API = ${esperado} mm`);
+
+  // 3 dias com chuva decaindo
+  const d3 = [
+    ...new Array(24).fill(10 / 24),
+    ...new Array(24).fill(10 / 24),
+    ...new Array(24).fill(10 / 24),
+  ];
+  const apiDia1 = 10;
+  const apiDia2 = 10 + GAMMA * apiDia1;
+  const apiDia3 = +(10 + GAMMA * apiDia2).toFixed(1);
+  assert.equal(computeApi(d3), apiDia3, `3 dias acumulados conferem com a fórmula analítica (${apiDia3} mm)`);
+});
+

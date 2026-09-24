@@ -161,7 +161,19 @@ export default function IphForecast({ readings }: Props) {
       )}
 
       {err && (
-        <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">{err}</div>
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <span>Falha ao gerar projeção: {err}</span>
+            <button
+              onClick={run}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 self-start rounded-lg bg-red-500/20 px-3 py-1 text-xs font-semibold text-red-200 ring-1 ring-red-400/30 hover:bg-red-500/30"
+            >
+              <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
+              Tentar novamente
+            </button>
+          </div>
+        </div>
       )}
 
       {out && (
@@ -292,9 +304,9 @@ export default function IphForecast({ readings }: Props) {
                   <YAxis
                     yAxisId="level"
                     domain={[
-                      (d: number) => Math.max(0, Math.floor((d - 0.3) * 10) / 10),
+                      (d: number) => (Number.isFinite(d) ? Math.max(0, Math.floor((d - 0.3) * 10) / 10) : 0),
                       (d: number) => {
-                        const base = Math.ceil((d + 0.4) * 10) / 10;
+                        const base = Number.isFinite(d) ? Math.ceil((d + 0.4) * 10) / 10 : 7;
                         if (!mostrarLimiares || !limiares.length) return base;
                         // o topo do eixo acompanha o maior limiar para que as
                         // linhas pontilhadas não fiquem fora da área plotada
@@ -311,7 +323,7 @@ export default function IphForecast({ readings }: Props) {
                   <YAxis
                     yAxisId="rain"
                     orientation="right"
-                    domain={[0, (d: number) => Math.max(4, Math.ceil(d * 2.5))]}
+                    domain={[0, (d: number) => (Number.isFinite(d) ? Math.max(4, Math.ceil(d * 2.5)) : 10)]}
                     tickFormatter={(v: number) => `${v}mm`}
                     tick={{ fill: '#c084fc', fontSize: 10 }}
                     axisLine={false}
