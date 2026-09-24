@@ -12,7 +12,26 @@ export interface BotThreshold {
   preWarningM?: number;
   /** mensagem do pré-aviso (mesmos placeholders; {pre} = cota do pré-aviso) */
   preWarningMessage?: string;
+  /** pré-aviso apenas quando o rio está SUBINDO (default: true) */
+  preWarningOnlyRise?: boolean;
 }
+
+/** Tendência da curva — decide se o aviso é de subida ou de descida. */
+export interface BotTrend {
+  dir: 'subida' | 'descida' | 'estavel' | 'indefinida';
+  rateCmH: number | null;
+  deltaM: number | null;
+  spanMin: number | null;
+  n: number;
+}
+
+/** Rótulos da tendência (usados no painel). */
+export const TREND_LABEL: Record<BotTrend['dir'], { texto: string; seta: string }> = {
+  subida: { texto: 'Subida', seta: '↑' },
+  descida: { texto: 'Descida', seta: '↓' },
+  estavel: { texto: 'Estável', seta: '→' },
+  indefinida: { texto: 'Indefinida', seta: '·' },
+};
 
 export interface BotSubscriber {
   chatId: number | string;
@@ -31,6 +50,9 @@ export interface BotLogEntry {
   chats: number;
   ok: boolean;
   reason?: string;
+  /** direção da curva no momento do disparo (null em stores antigos) */
+  direction?: string | null;
+  rateCmH?: number | null;
   error?: string | null;
 }
 
@@ -49,6 +71,8 @@ export interface BotConfig {
   thresholds: BotThreshold[];
   subscribers: BotSubscriber[];
   lastReading: { level: number; ts: number; flow: number | null; rain?: number | null; source?: string } | null;
+  /** tendência atual (subida/descida) calculada pelo servidor */
+  trend?: BotTrend;
   fired: Record<string, { ts: number; level: number }>;
   log: BotLogEntry[];
   telegramToken?: string;
@@ -119,7 +143,9 @@ export function verifyBot() {
   return request<BotConfig & { ok: boolean }>('/api/bot/verify', { method: 'POST' });
 }
 
-export function createThreshold(input: { name: string; meters: number; message: string }) {
+export function createThreshold(
+  input: Partial<BotThreshold> & { name: string; meters: number; message: string },
+) {
   return request<BotConfig & { ok: boolean; id: string }>('/api/bot/thresholds', {
     method: 'POST',
     body: JSON.stringify(input),

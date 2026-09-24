@@ -13,7 +13,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/index.mjs",
-    "prod": "npm run build && node server/index.mjs"
+    "prod": "npm run build && node server/index.mjs",
+    "test:modelo": "node scripts/test-modelo.mjs",
+    "check": "node scripts/test-modelo.mjs"
   },
   "dependencies": {
     "@types/leaflet": "^1.9.22",

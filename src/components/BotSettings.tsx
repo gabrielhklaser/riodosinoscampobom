@@ -6,11 +6,14 @@ import {
   CheckCircle2,
   Loader2,
   MessageCircle,
+  Minus,
   Pencil,
   Plus,
   RadioTower,
   RefreshCw,
   Send,
+  TrendingDown,
+  TrendingUp,
   Trash2,
   Users,
   X,
@@ -25,6 +28,7 @@ import {
   testThreshold,
   updateThreshold,
   verifyBot as verifyBotStatus,
+  TREND_LABEL,
   type BotConfig,
   type BotThreshold,
 } from '../lib/botApi';
@@ -32,8 +36,16 @@ import { BOT_START_LINK, BOT_USERNAME, parseChatId } from '../lib/telegramBridge
 
 const CARD = 'rounded-2xl border border-slate-800 bg-slate-900/70 shadow-xl shadow-black/20 ring-1 ring-white/5 backdrop-blur';
 const n2 = (v: number) => v.toFixed(2).replace('.', ',');
+const n1 = (v: number) => v.toFixed(1).replace('.', ',');
 
-const EMPTY_FORM = { name: '', meters: '', message: '', preWarningM: '0', preWarningMessage: '' };
+const EMPTY_FORM = {
+  name: '',
+  meters: '',
+  message: '',
+  preWarningM: '0',
+  preWarningMessage: '',
+  preWarningOnlyRise: true,
+};
 
 export default function BotSettings() {
   const [cfg, setCfg] = useState<BotConfig | null>(null);
@@ -102,6 +114,7 @@ export default function BotSettings() {
       message: t.message,
       preWarningM: t.preWarningM != null ? String(t.preWarningM).replace('.', ',') : '0',
       preWarningMessage: t.preWarningMessage || '',
+      preWarningOnlyRise: t.preWarningOnlyRise !== false,
     });
   }
 
@@ -161,6 +174,7 @@ export default function BotSettings() {
       message: form.message.trim(),
       preWarningM: Number(String(form.preWarningM).replace(',', '.') || 0),
       preWarningMessage: form.preWarningMessage.trim(),
+      preWarningOnlyRise: form.preWarningOnlyRise,
     };
     if (editing) {
       await run(() => updateThreshold(editing.id, payload));
@@ -217,7 +231,7 @@ export default function BotSettings() {
           </a>
         </div>
 
-        <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Stat
             icon={<RadioTower className="h-4 w-4" />}
             label="Status do bot"
@@ -250,7 +264,45 @@ export default function BotSettings() {
             }
             ok={!!cfg?.lastReading}
           />
+          {/* Tendência: decide se o aviso é de SUBIDA (mantém o pré-aviso) ou
+              de DESCIDA (só o aviso da cota batida). */}
+          {(() => {
+            const t = cfg?.trend;
+            const dir = t?.dir ?? 'indefinida';
+            const meta = TREND_LABEL[dir];
+            const icone =
+              dir === 'subida' ? (
+                <TrendingUp className="h-4 w-4" />
+              ) : dir === 'descida' ? (
+                <TrendingDown className="h-4 w-4" />
+              ) : (
+                <Minus className="h-4 w-4" />
+              );
+            const taxa = Number.isFinite(t?.rateCmH as number)
+              ? `${(t?.rateCmH ?? 0) > 0 ? '+' : ''}${n1(t?.rateCmH ?? 0)} cm/h`
+              : 'sem taxa';
+            return (
+              <Stat
+                icon={icone}
+                label="Tendência do rio"
+                value={`${meta.seta} ${meta.texto}`}
+                hint={`${taxa} · ${t?.n ?? 0} leitura(s) nas últimas 3 h`}
+                ok={dir === 'subida' || dir === 'descida' || dir === 'estavel'}
+              />
+            );
+          })()}
         </div>
+
+        <p className="mt-3 rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-[11px] leading-relaxed text-slate-400">
+          <strong className="text-slate-300">Regra dos avisos:</strong> o texto enviado sempre informa se o dado é de{' '}
+          <strong className="text-emerald-300">subida</strong> ou de{' '}
+          <strong className="text-rose-300">descida</strong> da curva. Em <strong>subida</strong> o limite mantém o
+          aviso normal <em>e</em> o pré-aviso; em <strong>descida</strong> o pré-aviso não é enviado — sai apenas o
+          aviso da cota que foi batida. Use os marcadores <code className="text-sky-300">{'{tendencia}'}</code>,{' '}
+          <code className="text-sky-300">{'{seta}'}</code>, <code className="text-sky-300">{'{taxa}'}</code> e{' '}
+          <code className="text-sky-300">{'{variacao}'}</code> na mensagem; se a mensagem não usar nenhum deles, o
+          servidor acrescenta a linha de tendência automaticamente.
+        </p>
 
         {/* Diagnóstico de conexão — dupla checagem do status real */}
         {cfg && !cfg.bot.ok && (
@@ -325,8 +377,9 @@ export default function BotSettings() {
         <div className="border-b border-slate-800 px-6 py-4">
           <h3 className="text-base font-bold text-white">Limites de alerta</h3>
           <p className="mt-0.5 text-xs text-slate-400">
-            Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'}, {'{nome}'} e{' '}
-            {'{pre}'} na mensagem. Novos limites entram na comparação automaticamente. O <strong className="text-slate-300">Pré-aviso</strong>{' '}
+            Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'}, {'{nome}'},{' '}
+            {'{pre}'}, {'{tendencia}'} (subida/descida), {'{seta}'} (↑/↓), {'{taxa}'} (cm/h), {'{variacao}'} (m) e{' '}
+            {'{vazao}'} na mensagem. Novos limites entram na comparação automaticamente. O <strong className="text-slate-300">Pré-aviso</strong>{' '}
             avisa antes da cota (ex.: 0,30 m antes). O botão <Send className="inline h-3 w-3" /> envia a mensagem daquele
             limite e o <Bell className="inline h-3 w-3" /> testa o pré-aviso — sempre marcados com “🧪 TESTE”, sem afetar
             os alertas reais.
@@ -372,6 +425,12 @@ export default function BotSettings() {
                         <>
                           <span className="font-semibold text-amber-300">{n2(t.meters - preM)} m</span>
                           <span className="block text-[10px] text-slate-600">({n2(preM)} m antes)</span>
+                          <span
+                            className="mt-0.5 inline-block rounded bg-emerald-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-300"
+                            title="O pré-aviso só sai quando o rio está subindo; em descida apenas o aviso da cota"
+                          >
+                            {t.preWarningOnlyRise === false ? 'sempre' : 'só na subida'}
+                          </span>
                         </>
                       ) : (
                         <span className="text-slate-600">desativado</span>
@@ -513,6 +572,22 @@ export default function BotSettings() {
             />
             <span className="mt-1 block text-[10px] text-slate-600">
               Só envia quando a distância acima for maior que 0. Sem mensagem, o pré-aviso não dispara.
+            </span>
+          </label>
+          <label className="flex items-start gap-2 rounded-lg border border-slate-800 bg-slate-950/50 p-3 md:col-span-6">
+            <input
+              type="checkbox"
+              checked={form.preWarningOnlyRise}
+              onChange={(e) => setForm((f) => ({ ...f, preWarningOnlyRise: e.target.checked }))}
+              className="mt-0.5 h-4 w-4 accent-emerald-500"
+            />
+            <span className="text-xs text-slate-300">
+              <strong className="text-slate-200">Pré-aviso apenas quando o rio está subindo</strong>
+              <span className="mt-0.5 block text-[11px] text-slate-500">
+                Recomendado. Com a caixa marcada, um disparo que vem de <strong>descida</strong> da curva envia
+                somente o aviso da cota batida — o pré-aviso é reservado às subidas (e ao nível estável). O texto do
+                aviso informa a direção em qualquer caso.
+              </span>
             </span>
           </label>
           <div className="md:col-span-6">
@@ -679,7 +754,24 @@ export default function BotSettings() {
                       </span>
                     )}
                   </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums text-sky-300">{n2(row.level)} m</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-sky-300">
+                    {n2(row.level)} m
+                    {row.direction ? (
+                      <span
+                        className={`ml-1.5 rounded px-1.5 py-0.5 text-[9px] font-bold ${
+                          row.direction === 'subida'
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : row.direction === 'descida'
+                              ? 'bg-rose-500/15 text-rose-300'
+                              : 'bg-slate-700/70 text-slate-300'
+                        }`}
+                        title={`Curva em ${row.direction}${Number.isFinite(row.rateCmH as number) ? ` (${n1(row.rateCmH ?? 0)} cm/h)` : ''}`}
+                      >
+                        {TREND_LABEL[(row.direction as keyof typeof TREND_LABEL) ?? 'indefinida']?.seta ?? '·'}{' '}
+                        {row.direction}
+                      </span>
+                    ) : null}
+                  </td>
                   <td className="px-3 py-2.5 text-right tabular-nums text-slate-400">{row.chats}</td>
                   <td className="px-6 py-2.5 text-xs">
                     {row.ok ? (

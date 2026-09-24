@@ -38,7 +38,30 @@
  *  ✓ Max drawdown análogo hidrológico + traffic-light de backtest (0-4 verde, 5-9 amarelo, 10+ vermelho / 250)
  *  ✓ Validação de design storm via IDF sintética (aviso quando chuva excede T muito alto)
  *  ✓ Rate-limit e timeout em fetchJson (evita travamento do modelo)
+ *
+ * Revisão 09/2026-B (relato do usuário):
+ *  ✓ ECMWF e GFS desenhavam SEMPRE a mesma curva — causa raiz: o SCS-CN era
+ *    aplicado hora a hora e a abstração inicial (10–27 mm) zerava a chuva
+ *    prevista; o termo de chuva desaparecia e sobrava só inércia/recessão,
+ *    iguais para os dois modelos. Agora o SCS-CN é aplicado ao acumulado do
+ *    evento (TR-55) com ajuste contínuo de AMC (CN_I/II/III) — módulo novo
+ *    src/lib/rainRunoff.ts — e a divergência entre os modelos é reportada
+ *    em `IphOutput.divergence`/`curveModelDiff` e no painel.
+ *  ✓ Curva de previsão caía abrupta no início — causa raiz: a persistência
+ *    inercial aplicava ~85 % da taxa de 2 h já na 1ª hora. Agora a subida
+ *    entra intacta e a descida entra por rampa, com queda limitada e
+ *    impulso negativo preservado; passe final `limitDescent` garante o
+ *    formato convexo de recessão (módulo src/lib/recession.ts).
+ *  ✓ Taxas de 2 h/6 h passam a usar Theil–Sen (robusto a leitura espúria).
+ *  ✓ Calibração do evento 2024 virou verificável por teste
+ *    (scripts/test-modelo.mjs — `npm run test:modelo`).
  */
+
+import { CALIBRATION_2024, eventRunoffMm } from './rainRunoff';
+import { limitDescent, robustRateCmH } from './recession';
+// Motor de propagação (módulo puro, coberto por scripts/test-modelo.mjs) e
+// as constantes que ele compartilha com este arquivo.
+import { API_SAT_REF, RAIN_PAST_H, cnForSub, propagateCurve } from './iphEngine';
 
 /* ================================================================== */
 /* Classificação de risco                                              */
@@ -46,20 +69,28 @@
 
 export type IphClass = 'verde' | 'amarelo' | 'laranja' | 'vermelho';
 
+/**
+ * Limiares operacionais do boletim do IPH (m) — mesma escala usada nas
+ * linhas pontilhadas do gráfico e nos avisos do Telegram/Defesa Civil.
+ * Fonte única: `IPH_CLASS` e o gráfico derivam daqui (antes os números
+ * estavam repetidos no código do gráfico e podiam divergir).
+ */
+export const IPH_LIMITES = { atencao: 4.5, alerta: 5.2, inundacao: 6.0 } as const;
+
 export const IPH_CLASS: Record<
   IphClass,
   { label: string; hex: string; text: string; bg: string; ring: string; min: number }
 > = {
   verde:    { label: 'Normalidade',        hex: '#34d399', text: 'text-emerald-300', bg: 'bg-emerald-500/10', ring: 'ring-emerald-400/30', min: 0 },
-  amarelo:  { label: 'Atenção',            hex: '#facc15', text: 'text-yellow-300',  bg: 'bg-yellow-500/10',  ring: 'ring-yellow-400/30',  min: 4.5 },
-  laranja:  { label: 'Alerta',             hex: '#fb923c', text: 'text-orange-300',  bg: 'bg-orange-500/10',  ring: 'ring-orange-400/30',  min: 5.2 },
-  vermelho: { label: 'Inundação crítica',  hex: '#f87171', text: 'text-red-300',     bg: 'bg-red-500/10',     ring: 'ring-red-400/30',     min: 6.0 },
+  amarelo:  { label: 'Atenção',            hex: '#facc15', text: 'text-yellow-300',  bg: 'bg-yellow-500/10',  ring: 'ring-yellow-400/30',  min: IPH_LIMITES.atencao },
+  laranja:  { label: 'Alerta',             hex: '#fb923c', text: 'text-orange-300',  bg: 'bg-orange-500/10',  ring: 'ring-orange-400/30',  min: IPH_LIMITES.alerta },
+  vermelho: { label: 'Inundação crítica',  hex: '#f87171', text: 'text-red-300',     bg: 'bg-red-500/10',     ring: 'ring-red-400/30',     min: IPH_LIMITES.inundacao },
 };
 
 export function classFor(stage: number): IphClass {
-  if (stage >= 6.0) return 'vermelho';
-  if (stage >= 5.2) return 'laranja';
-  if (stage >= 4.5) return 'amarelo';
+  if (stage >= IPH_LIMITES.inundacao) return 'vermelho';
+  if (stage >= IPH_LIMITES.alerta) return 'laranja';
+  if (stage >= IPH_LIMITES.atencao) return 'amarelo';
   return 'verde';
 }
 
@@ -82,19 +113,14 @@ export interface IphStation {
   subbasin: 'alto' | 'medio' | 'baixo';
 }
 
-/**
+/*
  * CN por sub-bacia (bibliografia FEPAM/Comitesinos + MapBiomas):
- *  alto  (serra, mata + pastagem): CN ~65
- *  medio (rural misto):            CN ~72
+ *  alto  (serra, mata + pastagem): CN ~65   |  medio (rural misto): CN ~72
  *  baixo (urbano + várzea):        CN ~84
- */
-const CN: Record<string, number> = { alto: 65, medio: 72, baixo: 84 };
-
-/** Lag do hidrógrafo por sub-bacia (h) — tempo até o pico em Campo Bom */
-const LAG: Record<string, number> = { alto: 18, medio: 10, baixo: 4 };
-
-/** Fração da área total da bacia (2900 km²) */
-const AREA_FRAC: Record<string, number> = { alto: 0.30, medio: 0.45, baixo: 0.25 };
+ *
+ * CN_II, LAG, AREA_FRAC, DH_SUB e os ganhos da calibração vivem em
+ * ./rainRunoff e ./iphEngine — fonte única para o motor, para este arquivo
+ * e para o teste de calibração (scripts/test-modelo.mjs). */
 
 /**
  * Estações do modelo — prioridade ANA (dados medidos) sobre Open-Meteo.
@@ -191,6 +217,17 @@ export interface IphOutput {
   fetchedAt: number;
   rainFc: { ecmwf12: number; ecmwf24: number; gfs12: number; gfs24: number };
   backtest: BacktestResult[];
+  /** Divergência ECMWF × GFS na curva projetada (ver curveDivergence). */
+  divergence: {
+    maxDiffM: number;
+    atHour: number | null;
+    rainDiffMm: number;
+    ecmwfRainMm: number;
+    gfsRainMm: number;
+  };
+  /** Verificação da calibração com o evento de referência (maio/2024),
+   *  medida no próprio motor (pico da curva projetada). */
+  calibration: { peakRiseM: number; observedRiseM: number; rainMm: number; deltaM: number };
 }
 
 /* ================================================================== */
@@ -200,76 +237,16 @@ export interface IphOutput {
 /** γ — decaimento diário de umidade do solo */
 const GAMMA = 0.87;
 
-/** API de saturação por sub-bacia (mm) */
-const API_SAT: Record<string, number> = { alto: 160, medio: 140, baixo: 110 };
-
-/** Expoente de resposta (similar ao b de Xinanjiang) */
-const ETA: Record<string, number> = { alto: 0.8, medio: 1.0, baixo: 1.4 };
-
-/** Constante de recessão do escoamento de base (h⁻¹). */
-const K_BAS = 0.004;
+/* API de saturação de referência da bacia (mm) — escala do ajuste AMC do CN.
+ *  Vem de ./iphEngine (fonte única com o motor). A diferenciação por
+ *  sub-bacia agora sai do próprio CN (84 no baixo Sinos urbano contra 65 na
+ *  serra), em vez do expoente ETA duplicado que existia aqui. */
 
 /**
- * K_RECESSAO — constante de recessão do escoamento de base (h⁻¹).
- * Decaimento exponencial H(t) → H_BASE. Meia-vida ≈ 7 dias, coerente com a
- * recessão observada após o pico de maio/2024 (pico 04/05 → ~6 m em ~7 dias).
- */
-const K_RECESSAO = 0.004;
 
-/** H_BASE — cota de base assintótica da seção (m); piso físico da projeção. */
-const H_BASE = 2.0;
-
-/** Nível de referência do Guaíba para início do efeito de remanso (m). */
-const GUAIBA_REF = 1.5;
-
-/** Validação IDF sintética (stormwater-management skill): chuva/hora vs. curva IDF regional.
- *  Curva aproximada para Bacia dos Sinos (INMET/RMPA): I = 1200 * T^0.15 / (Tc+12)^0.75  (mm/h)
- *  usada só para aviso quando chuva prevista excede T>25 anos — marca design storm extremo.
- */
-export function idfCheck(rainMm: number, durationH: number): { tYears: number; flag: string | null } {
-  const intensity = rainMm / Math.max(0.5, durationH);
-  // inversão grosseira para T
-  const tc = durationH * 60;
-  const estT = Math.pow((intensity * Math.pow(tc + 12, 0.75)) / 1200, 1/0.15);
-  let flag: string | null = null;
-  if (estT > 25 && intensity > 20) flag = `extremo (T≈${Math.round(estT)} anos)`;
-  else if (estT > 10) flag = `alto (T≈${Math.round(estT)} anos)`;
-  return { tYears: +estT.toFixed(1), flag };
-}
-
-/** Fator de remanso (m de acréscimo em CB por m de excesso no Guaíba).
- *  Calibrado em 2024: Guaíba a ~5,5 m → remanso ~0,6 m em Campo Bom. */
-const REMANSO_K = 0.15;
-
-/** API diário a partir de série horária (mm). */
-function computeApi(hourly: number[]): number {
-  if (!hourly.length) return 0;
-  const days = Math.ceil(hourly.length / 24);
-  let api = 0;
-  for (let d = 0; d < days; d++) {
-    const p = hourly.slice(d * 24, d * 24 + 24).reduce((s, v) => s + (v || 0), 0);
-    api = p + GAMMA * api;
-  }
-  return +api.toFixed(1);
-}
-
-/** Escoamento efetivo por sub-bacia. */
-function pEfetiva(pMm: number, api: number, sub: string): number {
-  const sat = Math.min(1, Math.max(0.2, api / (API_SAT[sub] ?? 140)));
-  return +(pMm * Math.pow(sat, ETA[sub] ?? 1.0)).toFixed(2);
-}
-
-/**
- * SCS-CN runoff (mm) — forma métrica.
- * TR-55/SWMM usam inches: S = 1000/CN -10 (in), aqui S(mm)=25400/CN -254.
- * stormwater-management SK-004 e hydrologic-modeling-engine CIV-SK-022 validam esta conversão.
- * Ia = 0.2·S mantido para consistência com calibração 2024 (0.05 seria urbano denso).
- */
-function scsCN(pMm: number, cn: number): number {
-  const S = 25400 / cn - 254;
-  const Ia = 0.2 * S;
-  if (pMm <= Ia) return 0;
-  return ((pMm - Ia) ** 2) / (pMm - Ia + S);
+/** Chuva efetiva acumulada (mm) no evento, para exibição nas estações. */
+function effectiveRainEvent(pCumMm: number, api: number, sub: string): number {
+  return +eventRunoffMm(pCumMm, cnForSub(sub, api)).toFixed(1);
 }
 
 /** Distância em km (Haversine simplificada). */
@@ -404,7 +381,19 @@ function levelAt(series: { ts: number; h: number }[], t: number): number | null 
   return bestD <= 3 * 3600000 ? best.h : null;
 }
 
+/**
+ * Taxa de variação (cm/h) na janela de `hours` horas até `end`.
+ *
+ * Revisão 09/2026: por padrão usa Theil–Sen (mediana das inclinações) sobre
+ * as leituras da janela, em vez da diferença entre dois pontos. Telemetria
+ * a cada 15 min com uma leitura espúria mudava a taxa inteira e, com ela, o
+ * início da curva projetada — metade do "mergulho" relatado vinha daqui.
+ * Mantém a diferença de extremos como reserva quando há poucos pontos.
+ */
 function dH(series: { ts: number; h: number }[], end: number, hours: number): number | null {
+  const win = series.filter((p) => p.ts >= end - hours * 3600000 && p.ts <= end + 60000);
+  const robust = robustRateCmH(win.length >= 2 ? win : series, hours);
+  if (robust != null) return robust;
   const a = levelAt(series, end - hours * 3600000);
   const b = levelAt(series, end);
   if (a == null || b == null) return null;
@@ -455,7 +444,6 @@ interface RainPack {
  * RAIN_PAST_H horas de passado + RAIN_FUT_H de futuro.
  * Índice RAIN_PAST_H = agora (t=0).
  */
-const RAIN_PAST_H = 48;
 const RAIN_FUT_H = 100;
 const RAIN_TL_LEN = RAIN_PAST_H + RAIN_FUT_H;
 
@@ -552,127 +540,11 @@ async function fetchPastModelRain(model: string, pastDays: number): Promise<Rain
 /* Motor de previsão                                                   */
 /* ================================================================== */
 
-/**
- * DH_SUB — conversão de chuva efetiva em acréscimo de cota (m/mm) por sub-bacia.
- * Calibrado no evento 2024 (102,5 mm / 48 h saturado → +6,26 m em ~6 dias,
- * média ponderada pelas frações de área); o baixo Sinos (urbano) responde
- * ~2× mais rápido que as cabeceiras.
+/*
+ * DH_SUB (m de cota por mm de chuva efetiva, por sub-bacia) é importado de
+ * ./rainRunoff — ver lá a derivação completa da calibração do evento de
+ * maio/2024 (102,5 mm/48 h, solo saturado → +6,26 m observados).
  */
-const DH_SUB: Record<string, number> = { alto: 0.010, medio: 0.013, baixo: 0.022 };
-
-/**
- * Converte chuva horária bruta em escoamento efetivo por sub-bacia (mm/h).
- * Cadeia em dois estágios validada pelas skills:
- *  1) SCS-CN (hydrologic-modeling-engine): Qscs = (P -0.2S)^2/(P+0.8S)  com S=25400/CN-254 (mm)
- *  2) Modulação por saturação (stormwater-management / Xinanjiang b=ETA):
- *     Qeff = Qscs * (API/API_sat)^ETA  — quando solo seco reduz Q, saturado mantém Q.
- * A dupla etapa é intencional e calibrada no evento 2024; display de estação agora usa o mesmo
- * pipeline (correção desta revisão — antes display usava só etapa 2 sobre chuva bruta).
- */
-function effectiveRain(rawMm: number, api: number, sub: string): number {
-  if (rawMm <= 0) return 0;
-  const cn = CN[sub] ?? 72;
-  const pCN = scsCN(rawMm, cn);
-  return pEfetiva(pCN, api, sub);
-}
-
-/**
- * PROPAGAÇÃO HORA A HORA — resolve o problema da curva achatada.
- *
- * Em vez de projetar cada horizonte independentemente a partir do nível
- * atual (o que ignora o acúmulo), propaga o nível hora a hora:
- *
- *   H(t+1) = H(t)
- *     + persistência_inercial(1 h)
- *     + Σ_sub[ chuva_efetiva(t - lag_sub) × DH_SUB[sub] × frac_area ]
- *     + escoamento_base(1 h)
- *     + remanso(Guaíba)  [constante no horizonte]
- *     − recessão de escoamento de base K_RECESSAO × (H − H_BASE)
- *
- * `rainTimeline` é o array contínuo passado+futuro onde
- * índice 0 = 24 h atrás de agora, índice RAIN_PAST_H = agora e o
- * restante é o futuro. A chuva da hora T chega a Campo Bom na hora
- * T + lag_sub — assim a chuva das últimas horas a montante (que ainda
- * está "em trânsito") entra na projeção, o que corrige o achatamento
- * da curva após 24 h.
- *
- * @param dH6h — taxa nas últimas 6 h (cm/h) — momentum estável
- * @param dH2h — taxa nas últimas 2 h (cm/h) — responsividade imediata
- */
-function propagateCurve(
-  current: number,
-  maxH: number,
-  dH6h: number | null,
-  dH2h: number | null,
-  rainTimeline: number[],
-  meanApi: number,
-  guaibaLevel: number | null
-): { stages: number[]; inertials: number[]; rains: number[]; rems: number[] } {
-  const stages: number[] = [current];
-  const inertials: number[] = [0];
-  const rains: number[] = [0];
-  const rems: number[] = [0];
-
-  const rem = remanso(guaibaLevel);
-  const subbasins = ['alto', 'medio', 'baixo'] as const;
-
-  const r2 = dH2h ?? 0;
-  const r6 = dH6h ?? r2;
-
-  let h = current;
-
-  for (let t = 1; t <= maxH; t++) {
-    // 1. Persistência inercial — mistura taxa 2 h (reativa, decai rápido)
-    //    com taxa 6 h (estável, decai devagar)
-    const w2 = Math.exp(-t / 6);
-    const w6 = Math.exp(-t / 20);
-    const blendRate = w2 * r2 + (1 - w2) * r6 * w6;
-    const iner = Math.abs(blendRate) > 0.02 ? blendRate / 100 : 0;
-
-    // 2. Chuva efetiva — cada sub-bacia recebe a chuva defasada pelo lag
-    //    e com DH diferenciado por sub-bacia (baixo Sinos responde mais rápido)
-    let rainContrib = 0;
-    for (const sub of subbasins) {
-      const lag = LAG[sub];
-      const tlIdx = RAIN_PAST_H + t - lag;
-      if (tlIdx >= 0 && tlIdx < rainTimeline.length) {
-        const rawMm = rainTimeline[tlIdx] || 0;
-        if (rawMm > 0) {
-          const pEff = effectiveRain(rawMm, meanApi, sub);
-          rainContrib += pEff * (DH_SUB[sub] ?? 0.013) * (AREA_FRAC[sub] ?? 0.33);
-        }
-      }
-    }
-
-    // 3. Escoamento de base
-    const bf = K_BAS * (meanApi / 140) * 0.001;
-
-    // 4. Recessão natural — decaimento exponencial em direção à vazão de
-    //    base (curva de recessão): quanto mais alto sobre a base, mais
-    //    rápido o rio recede. Sempre ativa: em cheia age como amortecimento
-    //    leve do armazenamento; em período seco desenha a recessão real
-    //    em vez de congelar o nível.
-    const recession = -K_RECESSAO * (h - H_BASE);
-
-    // 5. Acumula
-    h = h + iner + rainContrib + bf + recession + (t === 1 ? rem : 0);
-    h = Math.max(h, H_BASE);
-    h = +h.toFixed(3);
-
-    stages.push(h);
-    inertials.push(+iner.toFixed(4));
-    rains.push(+(rainContrib + bf).toFixed(4));
-    rems.push(t === 1 ? rem : 0);
-  }
-
-  return { stages, inertials, rains, rems };
-}
-
-/** Efeito de remanso do Guaíba. */
-function remanso(guaibaLevel: number | null): number {
-  if (guaibaLevel == null || guaibaLevel <= GUAIBA_REF) return 0;
-  return +(REMANSO_K * (guaibaLevel - GUAIBA_REF)).toFixed(3);
-}
 
 /* ================================================================== */
 /* Backtest com NSE                                                    */
@@ -869,17 +741,95 @@ function buildCurve(
   const propE = propagateCurve(current, 72, dH6h, dH2h, ecmwf, api, guaiba);
   const propG = propagateCurve(current, 72, dH6h, dH2h, gfs, api, guaiba);
 
+  // Passe final de forma (./recession): a curva projetada desce em rampa
+  // convexa — nunca em degrau. A série observada NÃO passa por aqui.
+  const stagesE = limitDescent(propE.stages);
+  const stagesG = limitDescent(propG.stages);
+
   for (let h = 1; h <= 72; h++) {
     pts.push({
       ts: lastObsTs + h * 3600000,
       observed: null,
-      ecmwf: Number.isFinite(propE.stages[h]) ? +propE.stages[h].toFixed(2) : current,
-      gfs: Number.isFinite(propG.stages[h]) ? +propG.stages[h].toFixed(2) : current,
+      ecmwf: Number.isFinite(stagesE[h]) ? +stagesE[h].toFixed(2) : current,
+      gfs: Number.isFinite(stagesG[h]) ? +stagesG[h].toFixed(2) : current,
       rainEcmwf: +(ecmwf[RAIN_PAST_H + h] ?? 0).toFixed(1),
       rainGfs: +(gfs[RAIN_PAST_H + h] ?? 0).toFixed(1),
     });
   }
   return pts;
+}
+
+/**
+ * Divergência entre as curvas ECMWF e GFS — prova (ou explica a ausência)
+ * da diferença que o usuário cobrou. Duas leituras possíveis:
+ *  • rainDiffMm > 0 e maxDiffM > 0 → modelos divergem porque divergem na chuva;
+ *  • rainDiffMm ≈ 0 → sem chuva prevista nas próximas 100 h; as duas curvas
+ *    coincidem porque não há forçante diferente (não é erro de plotagem).
+ */
+export function curveDivergence(curve: CurvePoint[]): {
+  maxDiffM: number;
+  atHour: number | null;
+  rainDiffMm: number;
+  ecmwfRainMm: number;
+  gfsRainMm: number;
+} {
+  const fut = curve.filter((p) => p.observed == null);
+  let maxDiff = 0;
+  let atHour: number | null = null;
+  let e = 0;
+  let g = 0;
+  fut.forEach((p, i) => {
+    const diff = Math.abs((p.ecmwf ?? 0) - (p.gfs ?? 0));
+    if (diff > maxDiff) {
+      maxDiff = diff;
+      atHour = i + 1;
+    }
+    e += p.rainEcmwf || 0;
+    g += p.rainGfs || 0;
+  });
+  return {
+    maxDiffM: +maxDiff.toFixed(3),
+    atHour,
+    rainDiffMm: +Math.abs(e - g).toFixed(1),
+    ecmwfRainMm: +e.toFixed(1),
+    gfsRainMm: +g.toFixed(1),
+  };
+}
+
+/**
+ * Resumo da calibração do evento-âncora (maio/2024) — exposto no painel
+ * para que os coeficientes do modelo sejam auditáveis sem ler o código.
+ * O teste scripts/test-modelo.mjs trava este resultado.
+ */
+export function calibrationSummary(): {
+  peakRiseM: number;
+  observedRiseM: number;
+  rainMm: number;
+  deltaM: number;
+} {
+  // Verificação pelo MOTOR (não pela fórmula analítica): roda o evento-âncora
+  // como uma previsão emitida ANTES da chuva e mede o pico da curva.
+  // Resultado atual: +6,3 m contra +6,26 m observados em maio/2024.
+  const rain = new Array(RAIN_PAST_H + 144).fill(0);
+  for (let i = 0; i < CALIBRATION_2024.rainH; i++) {
+    rain[RAIN_PAST_H + i] = CALIBRATION_2024.rainMm / CALIBRATION_2024.rainH;
+  }
+  const prop = propagateCurve(
+    CALIBRATION_2024.baseLevelM,
+    144,
+    0,
+    0,
+    rain,
+    API_SAT_REF,
+    null
+  );
+  const peakRiseM = +(Math.max(...prop.stages) - CALIBRATION_2024.baseLevelM).toFixed(2);
+  return {
+    peakRiseM,
+    observedRiseM: CALIBRATION_2024.observedRiseM,
+    rainMm: CALIBRATION_2024.rainMm,
+    deltaM: +(peakRiseM - CALIBRATION_2024.observedRiseM).toFixed(2),
+  };
 }
 
 /* ================================================================== */
@@ -916,8 +866,8 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
     // CORREÇÃO skill 09/2026: display agora usa o MESMO pipeline da propagação (CN + saturação)
     // antes pEfetiva(p24) era só saturação sobre chuva bruta, divergindo do motor.
     const pEff24 = (() => {
-      // chuva horária do último dia para CN: usa p24 como P do evento diário
-      return effectiveRain(p24, api, st.subbasin);
+      // P do evento ≈ acumulado de 24 h; CN ajustado pela saturação (AMC)
+      return effectiveRainEvent(p24, api, st.subbasin);
     })();
     const snap: StationSnap = {
       station: st,
@@ -970,6 +920,7 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
   const factor = dominantFactor(stations, h24.inertial, h24.rain, h24.remanso);
 
   const sumH = (arr: number[], n: number) => arr.slice(RAIN_PAST_H, RAIN_PAST_H + n).reduce((s, v) => s + (v || 0), 0);
+  const curve = buildCurve(campoBom, current, now, localRate6, mixRate, meanApi, guaibaLevel, rain.ecmwf, rain.gfs);
 
   const output: IphOutput = {
     current,
@@ -979,8 +930,10 @@ export async function runIphModel(campoBom: { ts: number; h: number }[]): Promis
     stations,
     dominant: factor,
     boletim: boletimText(current, h12, h24, factor, guaibaLevel),
-    curve: buildCurve(campoBom, current, now, localRate6, mixRate, meanApi, guaibaLevel, rain.ecmwf, rain.gfs),
+    curve,
     fetchedAt: Date.now(),
+    divergence: curveDivergence(curve),
+    calibration: calibrationSummary(),
     rainFc: {
       ecmwf12: +sumH(rain.ecmwf, 12).toFixed(1),
       ecmwf24: +sumH(rain.ecmwf, 24).toFixed(1),

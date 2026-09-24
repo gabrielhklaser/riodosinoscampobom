@@ -30,6 +30,13 @@ const TELEGRAM_BOT_USERNAME = (process.env.TELEGRAM_BOT_USERNAME || 'defesacivil
 
 const DATA_DIR = join(__dirname, 'data');
 const STORE_FILE = join(DATA_DIR, 'bot-config.json');
+
+/** Leituras mantidas no histórico curto — usado por loadStore() para não
+ *  crescer sem limite e pela tendência (subida/descida) dos avisos.
+ *  Fica AQUI, antes de `loadStore()`, porque o corte do histórico acontece
+ *  na própria leitura do arquivo (declarar depois causaria TDZ — o
+ *  try/catch do loadStore engoliria o erro e descartaria o store inteiro). */
+const TREND_HISTORY = 48;
 const DIST_DIR = join(__dirname, '..', 'dist');
 const TG = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_WEBHOOK_URL = (process.env.TELEGRAM_WEBHOOK_URL || '').trim();
@@ -244,8 +251,9 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
+      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
     preWarningM: 0.3,
+    preWarningOnlyRise: true,
     preWarningMessage:
       '🟡 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Atenção ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nMantenha atenção e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
   },
@@ -256,8 +264,9 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
+      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
     preWarningM: 0.3,
+    preWarningOnlyRise: true,
     preWarningMessage:
       '🟠 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Alerta ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nPrepare-se: identifique rotas de fuga e mantenha documentos acessíveis.\nDefesa Civil: (51) 3597-3683 · 199',
   },
@@ -268,8 +277,9 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
+      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
     preWarningM: 0.3,
+    preWarningOnlyRise: true,
     preWarningMessage:
       '🔴 PRÉ-AVISO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos está se aproximando do nível de Inundação ({cota} m).\nNível atual: {nivel} m (referência do pré-aviso: {pre} m).\nHorário: {hora}\n\nResidentes de áreas de risco: preparem-se para deixar a área. Não atravesse a margem.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
   },
@@ -285,6 +295,8 @@ function emptyStore() {
     subscribers: [],
     fired: {},
     lastReading: null,
+    /** histórico curto de leituras (para saber se o rio sobe ou desce) */
+    readings: [],
     log: [],
     outbox: [],
     bot: {
@@ -315,10 +327,14 @@ function loadStore() {
         return {
           ...t,
           preWarningM: t.preWarningM != null ? Number(t.preWarningM) || 0 : d ? d.preWarningM : 0,
+          preWarningOnlyRise: t.preWarningOnlyRise != null ? !!t.preWarningOnlyRise : true,
           preWarningMessage: t.preWarningMessage != null ? String(t.preWarningMessage) : d ? d.preWarningMessage : '',
         };
       }),
       subscribers: Array.isArray(raw.subscribers) ? raw.subscribers : [],
+      readings: Array.isArray(raw.readings)
+        ? raw.readings.filter((r) => Number.isFinite(r?.level) && Number.isFinite(r?.ts)).slice(-TREND_HISTORY)
+        : [],
       fired: raw.fired && typeof raw.fired === 'object' ? raw.fired : {},
       log: Array.isArray(raw.log) ? raw.log.slice(-80) : [],
       outbox: Array.isArray(raw.outbox) ? raw.outbox : [],
@@ -332,7 +348,10 @@ function loadStore() {
         consecutiveFails: Number((raw.bot && raw.bot.consecutiveFails) || 0),
       },
     };
-  } catch {
+  } catch (err) {
+    // Nunca falhar em silêncio: um erro de parsing/migração aqui já custou
+    // caro (o store inteiro era descartado sem aviso e os inscritos "sumiam").
+    console.error('[store] falha ao ler', STORE_FILE, '-', err && err.message);
     return emptyStore();
   }
 }
@@ -519,7 +538,102 @@ async function sendTelegram(chatId, text) {
   }
 }
 
-function interpolate(template, reading, threshold, preM = 0) {
+/* ------------------------------------------------------------------ */
+/* Tendência: o rio está SUBINDO ou DESCENDO?                          */
+/* ------------------------------------------------------------------ */
+/**
+ * Requisito da Defesa Civil: o aviso precisa dizer se o dado é de subida
+ * ou de descida da curva, e o PRÉ-AVISO só faz sentido quando o rio está
+ * subindo ("de descida não precisa do pré-aviso — só o aviso da cota que
+ * bateu").
+ *
+ * Regra (a mesma do painel, ver src/lib/recession.ts):
+ *   • variação vs. LEITURA ANTERIOR (peso 0,4) + taxa robusta das últimas
+ *     3 h por Theil–Sen (peso 0,6);
+ *   • escore > 0,2 → subida; < −0,2 → descida; senão estável;
+ *   • sem histórico suficiente → indefinida (mantém o comportamento antigo).
+ *
+ * A versão canônica/testada é a do TypeScript (scripts/test-modelo.mjs);
+ * esta cópia existe porque o servidor roda em Node puro (.mjs) e precisa do
+ * mesmo critério. Se mudar uma, mude a outra.
+ */
+const TREND_WINDOW_MS = 3 * 3600000; // janela da tendência
+
+function median(values) {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/** taxa (cm/h) por Theil–Sen na janela — robusta a leitura espúria */
+function robustRateCmH(serie, windowMs = TREND_WINDOW_MS) {
+  if (!Array.isArray(serie) || serie.length < 2) return null;
+  const fim = serie[serie.length - 1].ts;
+  const win = serie.filter((r) => r.ts >= fim - windowMs);
+  if (win.length < 2) return null;
+  const slopes = [];
+  for (let i = 0; i < win.length; i++) {
+    for (let j = i + 1; j < win.length; j++) {
+      const dtH = (win[j].ts - win[i].ts) / 3600000;
+      if (dtH < 1 / 60) continue;
+      slopes.push(((win[j].level - win[i].level) * 100) / dtH);
+    }
+  }
+  const m = median(slopes);
+  return m == null ? null : +m.toFixed(2);
+}
+
+/** direção, taxa e variação vs. leitura anterior */
+function trendOf(serie) {
+  const s = (Array.isArray(serie) ? serie : [])
+    .filter((r) => Number.isFinite(r?.ts) && Number.isFinite(r?.level))
+    .sort((a, b) => a.ts - b.ts);
+  if (s.length < 2) {
+    return { dir: 'indefinida', rateCmH: null, deltaM: null, spanMin: null, n: s.length };
+  }
+  const fim = s[s.length - 1].ts;
+  const win = s.filter((r) => r.ts >= fim - TREND_WINDOW_MS);
+  const rate = robustRateCmH(s);
+  const deltaM = +(s[s.length - 1].level - s[s.length - 2].level).toFixed(3);
+  const spanMin = +((s[s.length - 1].ts - win[0].ts) / 60000).toFixed(0);
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const score = (rate != null ? clamp(rate / 2, -1, 1) * 0.6 : 0) + clamp(deltaM / 0.03, -1, 1) * 0.4;
+  const dir = score > 0.2 ? 'subida' : score < -0.2 ? 'descida' : 'estavel';
+  return { dir, rateCmH: rate, deltaM, spanMin, n: win.length };
+}
+
+const TREND_META = {
+  subida: { seta: '↑', rotulo: 'subida', texto: 'Subida' },
+  descida: { seta: '↓', rotulo: 'descida', texto: 'Descida' },
+  estavel: { seta: '→', rotulo: 'estável', texto: 'Estável' },
+  indefinida: { seta: '·', rotulo: 'indefinida', texto: 'Indefinida' },
+};
+
+/** registra a leitura no histórico curto (dedup por carimbo de hora) */
+function recordReading(reading) {
+  if (!Number.isFinite(reading?.level) || !Number.isFinite(reading?.ts)) return;
+  if (!Array.isArray(store.readings)) store.readings = [];
+  const ts = reading.ts;
+  const ultima = store.readings[store.readings.length - 1];
+  if (ultima && Math.abs(ultima.ts - ts) < 60000) {
+    ultima.level = reading.level;
+    ultima.ts = ts;
+    return;
+  }
+  store.readings.push({ ts, level: reading.level });
+  if (store.readings.length > TREND_HISTORY) {
+    store.readings = store.readings.slice(-TREND_HISTORY);
+  }
+}
+
+/** true quando a tendência permite pré-aviso (subida ou estável) */
+function permitePreAviso(threshold, trend) {
+  if (threshold?.preWarningOnlyRise === false) return true; // regra antiga, por opção
+  return trend?.dir !== 'descida';
+}
+
+function interpolate(template, reading, threshold, preM = 0, trend = null) {
   const hora = reading.ts
     ? new Date(reading.ts).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
     : new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
@@ -527,22 +641,44 @@ function interpolate(template, reading, threshold, preM = 0) {
   const cota = Number(threshold.meters).toFixed(2).replace('.', ',');
   const pre = Number(threshold.meters - preM).toFixed(2).replace('.', ',');
   const vazao = reading.flow != null ? Number(reading.flow).toFixed(1).replace('.', ',') : '—';
-  return String(template || '')
+
+  // tendência: subida/descida da curva (o que a Defesa Civil pediu no aviso)
+  const meta = TREND_META[trend?.dir] || TREND_META.indefinida;
+  const taxaNum = trend?.rateCmH;
+  const taxa = Number.isFinite(taxaNum)
+    ? `${taxaNum > 0 ? '+' : ''}${Number(taxaNum).toFixed(1).replace('.', ',')}`
+    : '—';
+  const variacao = Number.isFinite(trend?.deltaM)
+    ? `${trend.deltaM > 0 ? '+' : ''}${Number(trend.deltaM).toFixed(2).replace('.', ',')}`
+    : '—';
+
+  const texto = String(template || '')
     .replaceAll('{nivel}', nivel)
     .replaceAll('{level}', nivel)
     .replaceAll('{cota}', cota)
     .replaceAll('{pre}', pre)
     .replaceAll('{nome}', threshold.name)
     .replaceAll('{hora}', hora)
-    .replaceAll('{vazao}', vazao);
+    .replaceAll('{vazao}', vazao)
+    .replaceAll('{tendencia}', meta.rotulo)
+    .replaceAll('{direcao}', meta.rotulo)
+    .replaceAll('{seta}', meta.seta)
+    .replaceAll('{taxa}', taxa)
+    .replaceAll('{variacao}', variacao);
+
+  // Garantia do requisito: TODO aviso diz se o rio sobe ou desce. Se o texto
+  // do operador não usar nenhum marcador de tendência, a linha é acrescentada.
+  const temMarcador = /\{(tendencia|direcao|seta|taxa|variacao)\}/.test(String(template || ''));
+  if (temMarcador) return texto;
+  return `${texto}\n\n${meta.seta} Rio em ${meta.rotulo} (${taxa} cm/h).`;
 }
 
-async function dispatchThreshold(threshold, reading, reason, preM = 0) {
+async function dispatchThreshold(threshold, reading, reason, preM = 0, trend = null) {
   const isTest = reason === 'teste_manual';
   // Teste vai marcado: o texto real do alerta não pode ser indistinguível
   // de um teste — num evento real, um "teste" sem marca apaga a confiança
   // dos inscritos no alerta.
-  const body = interpolate(threshold.message, reading, threshold, preM);
+  const body = interpolate(threshold.message, reading, threshold, preM, trend);
   const text = isTest
     ? `🧪 TESTE — não é um alerta real (mensagem do limite "${threshold.name}"${preM > 0 ? ' · pré-aviso' : ''}).\n\n${body}`
     : body;
@@ -557,6 +693,8 @@ async function dispatchThreshold(threshold, reading, reason, preM = 0) {
       meters: threshold.meters,
       level: reading.level,
       chats: 0,
+      direction: trend?.dir ?? null,
+      rateCmH: Number.isFinite(trend?.rateCmH) ? trend.rateCmH : null,
       ok: false,
       reason,
       error: 'Nenhum destinatário inscrito. Peça para a equipe iniciar o bot com /start.',
@@ -586,6 +724,9 @@ async function dispatchThreshold(threshold, reading, reason, preM = 0) {
     chats: okCount,
     ok: okCount > 0,
     reason,
+    /** direção da curva no momento do disparo (subida/descida/estavel) */
+    direction: trend?.dir ?? null,
+    rateCmH: Number.isFinite(trend?.rateCmH) ? trend.rateCmH : null,
     error: okCount ? null : results.map((r) => r.error).filter(Boolean).join('; ') || 'falha ao enviar',
   };
   store.log.unshift(entry);
@@ -604,13 +745,20 @@ async function evaluateReading(reading) {
     throw new Error('leitura inválida');
   }
 
+  const ts = reading.ts || Date.now();
   store.lastReading = {
     level: reading.level,
-    ts: reading.ts || Date.now(),
+    ts,
     flow: reading.flow ?? null,
     rain: reading.rain ?? null,
     source: reading.source || 'painel',
   };
+
+  // histórico curto + tendência ANTES de gravar a leitura nova: a comparação
+  // é sempre com as leituras anteriores (requisito: "faça a leitura anterior
+  // para saber se aquele disparo provém de uma subida ou de uma descida").
+  const trend = trendOf(store.readings);
+  recordReading({ ts, level: reading.level });
 
   const enabled = [...store.thresholds]
     .filter((t) => t.enabled !== false && Number.isFinite(Number(t.meters)))
@@ -627,13 +775,18 @@ async function evaluateReading(reading) {
     // pré-aviso duplo). Recua a marca quando o nível desce, para poder
     // avisar de novo se subir outra vez.
     const preM = Number(t.preWarningM) > 0 ? Number(t.preWarningM) : 0;
-    if (preM > 0 && t.preWarningMessage && !above) {
+    // Pré-aviso só quando o rio está subindo (ou estável). Em descida o
+    // pré-aviso é ruído: o nível está caindo, não há tendência a cruzar a
+    // cota — o operador recebe apenas o aviso da cota batida, se bater.
+    // A regra pode ser desligada por limite (preWarningOnlyRise: false).
+    const preOk = permitePreAviso(t, trend);
+    if (preM > 0 && t.preWarningMessage && !above && preOk) {
       const preLevel = Number(t.meters) - preM;
       const preFired = store.fired[`${t.id}:pre`];
       if (reading.level + 1e-9 >= preLevel && !preFired) {
-        store.fired[`${t.id}:pre`] = { ts: Date.now(), level: reading.level };
+        store.fired[`${t.id}:pre`] = { ts: Date.now(), level: reading.level, direction: trend.dir };
         saveStore();
-        const entry = await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'pre_alerta', preM);
+        const entry = await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'pre_alerta', preM, trend);
         dispatched.push(entry);
       } else if (reading.level < preLevel && preFired) {
         delete store.fired[`${t.id}:pre`];
@@ -641,9 +794,9 @@ async function evaluateReading(reading) {
     }
 
     if (above && !store.fired[t.id]) {
-      store.fired[t.id] = { ts: Date.now(), level: reading.level };
+      store.fired[t.id] = { ts: Date.now(), level: reading.level, direction: trend.dir };
       saveStore();
-      const entry = await dispatchThreshold(t, reading, 'cruzou_limite');
+      const entry = await dispatchThreshold(t, reading, 'cruzou_limite', 0, trend);
       dispatched.push(entry);
     } else if (!above && store.fired[t.id]) {
       delete store.fired[t.id];
@@ -652,7 +805,7 @@ async function evaluateReading(reading) {
   }
 
   saveStore();
-  return { reading: store.lastReading, dispatched };
+  return { reading: store.lastReading, trend, dispatched };
 }
 
 /* ------------------------------------------------------------------ */
@@ -680,9 +833,11 @@ function nivelText() {
     .filter((t) => t.enabled !== false && r.level >= t.meters)
     .sort((a, b) => b.meters - a.meters)[0];
   const situacao = active ? active.name : 'Normal';
+  const meta = TREND_META[trendOf(store.readings).dir] || TREND_META.indefinida;
   return (
     `Rio dos Sinos — Campo Bom\n` +
     `Nível: ${n} m\n` +
+    `Tendência: ${meta.seta} ${meta.rotulo}\n` +
     `Situação: ${situacao}\n` +
     `Horário: ${hora}` +
     (r.flow != null ? `\nVazão: ${Number(r.flow).toFixed(1).replace('.', ',')} m³/s` : '')
@@ -975,6 +1130,8 @@ function publicConfig() {
       active: s.active !== false,
     })),
     lastReading: store.lastReading,
+    /** tendência atual da curva (subida/descida) — exibida no painel */
+    trend: trendOf(store.readings),
     fired: store.fired,
     log: store.log.slice(0, 40),
     // Nunca expor o token por padrão: quem tem o token controla o bot.
@@ -1008,13 +1165,24 @@ function normalizeThreshold(input, fallback = {}) {
     input.preWarningMessage == null
       ? String(fallback.preWarningMessage ?? '')
       : String(input.preWarningMessage).trim();
+  // pré-aviso só na subida (default LIGADO — requisito da Defesa Civil)
+  const preWarningOnlyRise =
+    input.preWarningOnlyRise == null ? fallback.preWarningOnlyRise !== false : !!input.preWarningOnlyRise;
   if (!name) throw new Error('informe o nome do limite');
   if (!Number.isFinite(meters) || meters <= 0 || meters > 30) throw new Error('cota inválida (metros)');
   if (!message) throw new Error('informe a mensagem do alerta');
   if (!Number.isFinite(preWarningM) || preWarningM < 0 || preWarningM > 5) {
     throw new Error('pré-alerta inválido (use 0 a 5 m antes da cota; 0 desativa)');
   }
-  return { name, meters: +meters.toFixed(2), message, enabled, preWarningM: +preWarningM.toFixed(2), preWarningMessage };
+  return {
+    name,
+    meters: +meters.toFixed(2),
+    message,
+    enabled,
+    preWarningM: +preWarningM.toFixed(2),
+    preWarningOnlyRise,
+    preWarningMessage,
+  };
 }
 
 const MIME = {
@@ -1109,6 +1277,28 @@ const server = createServer(async (req, res) => {
         atualizadoEm: r.atualizadoEm,
         fallback: r.fallback,
         avisos: r.avisos,
+      });
+      return;
+    }
+
+    // Limiares configurados para envio (público e sem dados sensíveis): é o
+    // que o gráfico do painel desenha como linhas pontilhadas — assim o
+    // gráfico e o bot nunca divergem (requisito: "iguais aos do Telegram").
+    if (req.method === 'GET' && path === '/api/limiares') {
+      send(res, 200, {
+        ok: true,
+        atualizadoEm: Date.now(),
+        limiares: [...store.thresholds]
+          .filter((t) => t.enabled !== false && Number.isFinite(Number(t.meters)))
+          .sort((a, b) => a.meters - b.meters)
+          .map((t) => ({
+            id: t.id,
+            name: t.name,
+            meters: t.meters,
+            preWarningM: Number(t.preWarningM) || 0,
+            preWarningOnlyRise: t.preWarningOnlyRise !== false,
+            enabled: true,
+          })),
       });
       return;
     }
@@ -1322,9 +1512,12 @@ const server = createServer(async (req, res) => {
         return;
       }
       const reading = store.lastReading || { level: t.meters, ts: Date.now(), flow: null };
+      // o teste usa a tendência REAL do momento, para o operador ver na
+      // prática como a mensagem sai com {tendencia}/{taxa} preenchidos
+      const trendAtual = trendOf(store.readings);
       const entry = preTest
-        ? await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'teste_manual', preM)
-        : await dispatchThreshold(t, reading, 'teste_manual');
+        ? await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'teste_manual', preM, trendAtual)
+        : await dispatchThreshold(t, reading, 'teste_manual', 0, trendAtual);
       send(res, 200, { ok: true, entry, ...publicConfig() });
       return;
     }

@@ -11,8 +11,8 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { Activity, AlertTriangle, Clock, CloudRain, FileText, RefreshCw, Sparkles, Waves } from 'lucide-react';
-import { IPH_CLASS, IPH_STATIONS, runIphModel, type IphOutput } from '../lib/iphModel';
+import { Activity, AlertTriangle, Clock, CloudRain, FileText, RefreshCw, Ruler, Sparkles, Waves } from 'lucide-react';
+import { IPH_CLASS, IPH_LIMITES, IPH_STATIONS, runIphModel, type IphOutput } from '../lib/iphModel';
 import type { Reading } from '../lib/ana';
 
 interface Props {
@@ -22,6 +22,26 @@ interface Props {
 
 const n2 = (v: number) => v.toFixed(2).replace('.', ',');
 const n1 = (v: number) => v.toFixed(1).replace('.', ',');
+
+/** Limite de alerta exibido no gráfico (mesmos valores configurados para o
+ *  envio pelo Telegram — buscados em /api/limiares; ver useEffect abaixo). */
+interface Limiar {
+  id: string;
+  name: string;
+  meters: number;
+  preWarningM?: number;
+  enabled?: boolean;
+}
+
+/** Reserva: se o servidor não responder, usa os limiares operacionais do
+ *  boletim (IPH_LIMITES em src/lib/iphModel.ts) — os mesmos do painel. */
+const LIMIARES_RESERVA: Limiar[] = [
+  { id: 'atencao', name: 'Atenção', meters: IPH_LIMITES.atencao, enabled: true },
+  { id: 'alerta', name: 'Alerta', meters: IPH_LIMITES.alerta, enabled: true },
+  { id: 'inundacao', name: 'Inundação', meters: IPH_LIMITES.inundacao, enabled: true },
+];
+
+const CORES_LIMIAR = ['#facc15', '#fb923c', '#f87171', '#f472b6', '#a78bfa'];
 
 const CARD =
   'rounded-2xl border border-slate-800 bg-slate-900/70 shadow-xl shadow-black/20 ring-1 ring-white/5 backdrop-blur';
@@ -69,6 +89,26 @@ export default function IphForecast({ readings }: Props) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [rainModel, setRainModel] = useState<'ecmwf' | 'gfs'>('ecmwf');
+  // Limiares do gráfico = MESMOS valores configurados para envio pelo Telegram
+  // (endpoint público /api/limiares). Se o servidor não responder, cai nos
+  // limiares operacionais do boletim — nunca em números soltos no JSX.
+  const [limiares, setLimiares] = useState<Limiar[]>(LIMIARES_RESERVA);
+  const [mostrarLimiares, setMostrarLimiares] = useState(true);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch('/api/limiares')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const lista = Array.isArray(d?.limiares) ? (d.limiares as Limiar[]) : [];
+        const ativos = lista.filter((l) => l && Number.isFinite(l.meters) && l.enabled !== false);
+        if (vivo && ativos.length) setLimiares(ativos);
+      })
+      .catch(() => undefined);
+    return () => {
+      vivo = false;
+    };
+  }, []);
 
   const run = useCallback(async () => {
     if (!readings.length) return;
@@ -122,8 +162,10 @@ export default function IphForecast({ readings }: Props) {
           <p className="text-xs leading-relaxed text-amber-100">
           <strong className="font-bold">Módulo experimental.</strong> Modelo estatístico simplificado de
           acumulação hora a hora por sub-bacias — não é um modelo hidrodinâmico e não substitui modelos
-          operacionais nem os boletins da Defesa Civil. Limiares deste boletim (4,50 / 5,20 / 6,00 m) são
-          os operacionais municipais — distintos das cotas oficiais do SGB usadas no restante do painel.
+          operacionais nem os boletins da Defesa Civil. As linhas pontilhadas do gráfico são os{' '}
+          <strong className="text-amber-200">limiares configurados para envio pelo Telegram</strong>{' '}
+          ({limiares.map((l) => n2(l.meters)).join(' / ')} m), os mesmos exibidos no painel do bot — distintos
+          das cotas oficiais do SGB usadas no restante do painel.
         </p>
       </div>
 
@@ -206,7 +248,19 @@ export default function IphForecast({ readings }: Props) {
                 <Waves className="h-4 w-4 text-teal-400" />
                 Curva observada (24 h) e projeções GFS / ECMWF (72 h)
               </h3>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setMostrarLimiares((v) => !v)}
+                  title="Mostrar/esconder as linhas dos limiares de envio do Telegram (o eixo é expandido para que fiquem visíveis)"
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-semibold ring-1 transition ${
+                    mostrarLimiares
+                      ? 'bg-amber-500/15 text-amber-200 ring-amber-400/30'
+                      : 'bg-slate-800/80 text-slate-400 ring-white/5 hover:text-slate-200'
+                  }`}
+                >
+                  <Ruler className="h-3.5 w-3.5" />
+                  Limiares do Telegram
+                </button>
                 <span className="text-[11px] text-slate-500">Chuva prevista:</span>
                 <div className="inline-flex rounded-lg bg-slate-800/80 p-0.5 ring-1 ring-white/5">
                   <button
@@ -255,7 +309,14 @@ export default function IphForecast({ readings }: Props) {
                     yAxisId="level"
                     domain={[
                       (d: number) => Math.max(0, Math.floor((d - 0.3) * 10) / 10),
-                      (d: number) => Math.ceil((d + 0.4) * 10) / 10,
+                      (d: number) => {
+                        const base = Math.ceil((d + 0.4) * 10) / 10;
+                        if (!mostrarLimiares || !limiares.length) return base;
+                        // o topo do eixo acompanha o maior limiar para que as
+                        // linhas pontilhadas não fiquem fora da área plotada
+                        const topo = Math.max(...limiares.map((l) => l.meters));
+                        return Math.max(base, Math.ceil((topo + 0.3) * 10) / 10);
+                      },
                     ]}
                     tickFormatter={(v: number) => `${v.toFixed(1)}m`}
                     tick={{ fill: '#64748b', fontSize: 11 }}
@@ -274,9 +335,26 @@ export default function IphForecast({ readings }: Props) {
                     width={38}
                   />
                   <Tooltip content={<ForecastTip rainModel={rainModel} />} />
-                  <ReferenceLine yAxisId="level" y={4.5} stroke="#facc15" strokeDasharray="4 4" strokeOpacity={0.7} />
-                  <ReferenceLine yAxisId="level" y={5.2} stroke="#fb923c" strokeDasharray="4 4" strokeOpacity={0.7} />
-                  <ReferenceLine yAxisId="level" y={6.0} stroke="#f87171" strokeDasharray="4 4" strokeOpacity={0.85} />
+                  {mostrarLimiares &&
+                    limiares.map((l, i) => {
+                      const cor = CORES_LIMIAR[i % CORES_LIMIAR.length];
+                      return (
+                        <ReferenceLine
+                          key={l.id}
+                          yAxisId="level"
+                          y={l.meters}
+                          stroke={cor}
+                          strokeDasharray="4 4"
+                          strokeOpacity={0.8}
+                          label={{
+                            value: `${l.name} ${n2(l.meters)} m`,
+                            position: 'insideBottomRight',
+                            fill: cor,
+                            fontSize: 10,
+                          }}
+                        />
+                      );
+                    })}
                   {/* barras de chuva — atrás das curvas */}
                   <Bar
                     yAxisId="rain"
@@ -344,15 +422,35 @@ export default function IphForecast({ readings }: Props) {
                 />
                 Chuva {rainModel === 'ecmwf' ? 'ECMWF' : 'GFS'} (mm)
               </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="h-0 w-4 border-t border-dashed border-yellow-400" /> 4,50 m
-              </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="h-0 w-4 border-t border-dashed border-orange-400" /> 5,20 m
-              </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="h-0 w-4 border-t border-dashed border-red-400" /> 6,00 m
-              </span>
+              {out.divergence && (
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${
+                    out.divergence.maxDiffM > 0.05
+                      ? 'bg-indigo-500/10 text-indigo-200 ring-indigo-400/25'
+                      : 'bg-slate-800/70 text-slate-400 ring-white/5'
+                  }`}
+                  title="Diferença máxima entre as duas curvas projetadas (ECMWF × GFS)"
+                >
+                  {out.divergence.maxDiffM > 0.005
+                    ? `ECMWF × GFS: até ${n2(out.divergence.maxDiffM)} m${out.divergence.atHour ? ` em +${out.divergence.atHour} h` : ''}`
+                    : `ECMWF e GFS coincidem — chuva prevista praticamente igual (${n1(
+                        out.divergence.ecmwfRainMm
+                      )} mm × ${n1(out.divergence.gfsRainMm)} mm)`}
+                </span>
+              )}
+              {mostrarLimiares &&
+                limiares.map((l, i) => (
+                  <span key={`leg-${l.id}`} className="inline-flex items-center gap-1.5">
+                    <span
+                      className="h-0 w-4 border-t border-dashed"
+                      style={{ borderColor: CORES_LIMIAR[i % CORES_LIMIAR.length] }}
+                    />
+                    {l.name} {n2(l.meters)} m
+                    {l.preWarningM ? (
+                      <span className="text-slate-600">(pré-aviso {n2(Math.max(0, l.meters - l.preWarningM))} m)</span>
+                    ) : null}
+                  </span>
+                ))}
             </div>
           </div>
 
@@ -539,12 +637,18 @@ export default function IphForecast({ readings }: Props) {
             escoam. base + remanso(Guaíba) − recessão K·(H−H_base).
             3 sub-bacias: alto (CN 65, lag 18 h) · médio (CN 72, lag 10 h) · baixo (CN 84, lag 4 h).
             Chuva passada (48 h) + futura (100 h) com defasagem por sub-bacia.
-            Interpolação IDW. API diário (γ=0,87) com saturação diferenciada (stormwater-management SK-004).
-            SCS-CN em mm S=25400/CN−254 (hydrologic-modeling-engine CIV-SK-022) + modulação Xinanjiang b=ETA.
+            Interpolação IDW. API diário (γ=0,87) com ajuste contínuo de umidade antecedente (AMC I/II/III,
+            stormwater-management SK-004). <strong className="text-slate-400">SCS-CN aplicado ao acumulado do
+            evento</strong> (S=25400/CN−254, hydrologic-modeling-engine CIV-SK-022) — a versão anterior aplicava o
+            CN hora a hora e a abstração inicial zerava a chuva prevista, o que fazia ECMWF e GFS desenharem a
+            mesma curva. Subida responde na hora; descida entra por rampa de recessão (nunca em degrau).
             Condição de contorno: nível do Guaíba (87450020, remanso k=0,15 acima de 1,50 m).
             Recessão: decaimento exponencial para H_base = 2,00 m (K = 0,004 h⁻¹).
             Validação: MAE, RMSE, NSE, <strong className="text-emerald-300">VaR<sub>95</sub>/CVaR<sub>95</sub>, MaxDD e traffic-light de backtest</strong> (risk-metrics-calculation wshobson) + linha de base de persistência (origens a cada 3 h nas últimas 72 h, chuva analisada alinhada à origem — sem look-ahead).
             Digest: IDF sintética regional avisa design storm T&gt;25 anos (stormwater-management).
+            Calibração verificada por teste (npm run test:modelo): evento de maio/2024 (102,5 mm/48 h, solo
+            saturado) eleva <strong className="text-emerald-300">{n2(out.calibration.peakRiseM)} m</strong> no pico
+            contra <strong className="text-slate-300">+{n2(out.calibration.observedRiseM)} m observados</strong>.
             Estações: {IPH_STATIONS.map((s) => s.name).join(', ')}.
           </p>
         </>

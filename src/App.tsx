@@ -100,6 +100,27 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
   const [tab, setTab] = useState<'painel' | 'bot'>('painel');
+  // Limites que o bot do Telegram envia (fonte única: servidor, /api/limiares).
+  // O gráfico desenha os que diferem das cotas oficiais do SGB, para que o
+  // painel e os avisos enviados nunca mostrem escalas diferentes.
+  const [envioLimits, setEnvioLimits] = useState<{ id: string; name: string; meters: number }[]>([]);
+
+  // Limites de envio do bot (públicos, sem dados sensíveis): o gráfico do
+  // painel passa a desenhar EXATAMENTE os limites em que o Telegram dispara.
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/limiares')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const lista = Array.isArray(d?.limiares) ? d.limiares : [];
+        const validos = lista.filter((l: any) => l && Number.isFinite(l.meters));
+        if (alive && validos.length) setEnvioLimits(validos);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Token recusado pelo servidor (expirou/revogado): fecha o painel técnico.
   useEffect(() => {
@@ -628,6 +649,7 @@ export default function App() {
                   spanHours={cfg.hours}
                   showRain={showRain}
                   rainStations={activeRainStations}
+                  envioLimits={envioLimits}
                 />
               )}
             </div>
@@ -638,6 +660,15 @@ export default function App() {
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-yellow-400" /> Atenção {n2(COTAS.atencao)} m</span>
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-orange-400" /> Alerta {n2(COTAS.alerta)} m</span>
               <span className="inline-flex items-center gap-1.5"><span className="h-0 w-6 border-t-2 border-dashed border-red-400" /> Inundação {n2(COTAS.inundacao)} m</span>
+              {envioLimits
+                .filter((l) => ![COTAS.atencao, COTAS.alerta, COTAS.inundacao].some((c) => Math.abs(c - l.meters) < 0.011))
+                .sort((a, b) => a.meters - b.meters)
+                .map((l) => (
+                  <span key={`leg-envio-${l.id}`} className="inline-flex items-center gap-1.5">
+                    <span className="h-0 w-6 border-t border-dashed border-slate-400" />
+                    {l.name} (envio Telegram) {n2(l.meters)} m
+                  </span>
+                ))}
             </div>
           </section>
 
