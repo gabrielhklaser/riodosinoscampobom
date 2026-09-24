@@ -23,22 +23,23 @@ interface Props {
 const n2 = (v: number) => v.toFixed(2).replace('.', ',');
 const n1 = (v: number) => v.toFixed(1).replace('.', ',');
 
-/** Limite de alerta exibido no gráfico (mesmos valores configurados para o
- *  envio pelo Telegram — buscados em /api/limiares; ver useEffect abaixo). */
+/** Limite de alerta exibido no gráfico (rotação de cores por ordem). */
 interface Limiar {
   id: string;
   name: string;
   meters: number;
-  preWarningM?: number;
-  enabled?: boolean;
 }
 
-/** Reserva: se o servidor não responder, usa os limiares operacionais do
- *  boletim (IPH_LIMITES em src/lib/iphModel.ts) — os mesmos do painel. */
-const LIMIARES_RESERVA: Limiar[] = [
-  { id: 'atencao', name: 'Atenção', meters: IPH_LIMITES.atencao, enabled: true },
-  { id: 'alerta', name: 'Alerta', meters: IPH_LIMITES.alerta, enabled: true },
-  { id: 'inundacao', name: 'Inundação', meters: IPH_LIMITES.inundacao, enabled: true },
+/**
+ * Cotas de alerta do gráfico = COTAS OFICIAIS do SGB (IPH_LIMITES, derivado
+ * de `COTAS` em ./ana) — as MESMAS usadas pelo bot do Telegram e pelo
+ * gráfico principal. Escala única em todo o produto: não há mais 4,50/5,20/
+ * 6,00 m aqui e 6,20/6,70/7,20 m no restante do painel.
+ */
+const COTAS_ALERTA: Limiar[] = [
+  { id: 'atencao', name: 'Atenção', meters: IPH_LIMITES.atencao },
+  { id: 'alerta', name: 'Alerta', meters: IPH_LIMITES.alerta },
+  { id: 'inundacao', name: 'Inundação', meters: IPH_LIMITES.inundacao },
 ];
 
 const CORES_LIMIAR = ['#facc15', '#fb923c', '#f87171', '#f472b6', '#a78bfa'];
@@ -89,26 +90,9 @@ export default function IphForecast({ readings }: Props) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [rainModel, setRainModel] = useState<'ecmwf' | 'gfs'>('ecmwf');
-  // Limiares do gráfico = MESMOS valores configurados para envio pelo Telegram
-  // (endpoint público /api/limiares). Se o servidor não responder, cai nos
-  // limiares operacionais do boletim — nunca em números soltos no JSX.
-  const [limiares, setLimiares] = useState<Limiar[]>(LIMIARES_RESERVA);
+  // Escala única em todo o produto: as cotas oficiais do SGB (ver COTAS_ALERTA).
+  const limiares = COTAS_ALERTA;
   const [mostrarLimiares, setMostrarLimiares] = useState(true);
-
-  useEffect(() => {
-    let vivo = true;
-    fetch('/api/limiares')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        const lista = Array.isArray(d?.limiares) ? (d.limiares as Limiar[]) : [];
-        const ativos = lista.filter((l) => l && Number.isFinite(l.meters) && l.enabled !== false);
-        if (vivo && ativos.length) setLimiares(ativos);
-      })
-      .catch(() => undefined);
-    return () => {
-      vivo = false;
-    };
-  }, []);
 
   const run = useCallback(async () => {
     if (!readings.length) return;
@@ -162,10 +146,10 @@ export default function IphForecast({ readings }: Props) {
           <p className="text-xs leading-relaxed text-amber-100">
           <strong className="font-bold">Módulo experimental.</strong> Modelo estatístico simplificado de
           acumulação hora a hora por sub-bacias — não é um modelo hidrodinâmico e não substitui modelos
-          operacionais nem os boletins da Defesa Civil. As linhas pontilhadas do gráfico são os{' '}
-          <strong className="text-amber-200">limiares configurados para envio pelo Telegram</strong>{' '}
-          ({limiares.map((l) => n2(l.meters)).join(' / ')} m), os mesmos exibidos no painel do bot — distintos
-          das cotas oficiais do SGB usadas no restante do painel.
+          operacionais nem os boletins da Defesa Civil. As linhas pontilhadas do gráfico são as{' '}
+          <strong className="text-amber-200">cotas oficiais do SGB</strong> (
+          {limiares.map((l) => n2(l.meters)).join(' / ')} m) — exatamente as mesmas usadas pelo painel principal
+          e pelos avisos do bot do Telegram.
         </p>
       </div>
 
@@ -251,7 +235,7 @@ export default function IphForecast({ readings }: Props) {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   onClick={() => setMostrarLimiares((v) => !v)}
-                  title="Mostrar/esconder as linhas dos limiares de envio do Telegram (o eixo é expandido para que fiquem visíveis)"
+                  title="Mostrar/esconder as linhas das cotas oficiais do SGB (o eixo é expandido para que fiquem visíveis)"
                   className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-semibold ring-1 transition ${
                     mostrarLimiares
                       ? 'bg-amber-500/15 text-amber-200 ring-amber-400/30'
@@ -259,7 +243,7 @@ export default function IphForecast({ readings }: Props) {
                   }`}
                 >
                   <Ruler className="h-3.5 w-3.5" />
-                  Limiares do Telegram
+                  Cotas oficiais
                 </button>
                 <span className="text-[11px] text-slate-500">Chuva prevista:</span>
                 <div className="inline-flex rounded-lg bg-slate-800/80 p-0.5 ring-1 ring-white/5">
@@ -446,9 +430,6 @@ export default function IphForecast({ readings }: Props) {
                       style={{ borderColor: CORES_LIMIAR[i % CORES_LIMIAR.length] }}
                     />
                     {l.name} {n2(l.meters)} m
-                    {l.preWarningM ? (
-                      <span className="text-slate-600">(pré-aviso {n2(Math.max(0, l.meters - l.preWarningM))} m)</span>
-                    ) : null}
                   </span>
                 ))}
             </div>
@@ -642,6 +623,8 @@ export default function IphForecast({ readings }: Props) {
             evento</strong> (S=25400/CN−254, hydrologic-modeling-engine CIV-SK-022) — a versão anterior aplicava o
             CN hora a hora e a abstração inicial zerava a chuva prevista, o que fazia ECMWF e GFS desenharem a
             mesma curva. Subida responde na hora; descida entra por rampa de recessão (nunca em degrau).
+            Limiares de alerta: as cotas oficiais do SGB ({limiares.map((l) => n2(l.meters)).join('/')} m),
+            iguais às do bot e do painel principal (fonte única: COTAS em src/lib/ana.ts).
             Condição de contorno: nível do Guaíba (87450020, remanso k=0,15 acima de 1,50 m).
             Recessão: decaimento exponencial para H_base = 2,00 m (K = 0,004 h⁻¹).
             Validação: MAE, RMSE, NSE, <strong className="text-emerald-300">VaR<sub>95</sub>/CVaR<sub>95</sub>, MaxDD e traffic-light de backtest</strong> (risk-metrics-calculation wshobson) + linha de base de persistência (origens a cada 3 h nas últimas 72 h, chuva analisada alinhada à origem — sem look-ahead).

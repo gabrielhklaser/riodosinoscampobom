@@ -21,18 +21,7 @@ interface Props {
   showRain: boolean;
   /** nº de estações usadas na média pluviométrica */
   rainStations: number;
-  /**
-   * Limites que o bot do Telegram está configurado para ENVIAR (lidos do
-   * servidor em /api/limiares). Desenhados como linhas pontilhadas próprias
-   * quando diferem das cotas oficiais do SGB — assim o gráfico e os avisos
-   * enviados nunca divergem (antes o painel mostrava 6,20/6,70/7,20 e o
-   * boletim 4,50/5,20/6,00 sem indicação da diferença).
-   */
-  envioLimits?: { id: string; name: string; meters: number }[];
 }
-
-/** cor das linhas de envio (diferente das cotas oficiais) */
-const ENVIO_COLOR = '#94a3b8'; // slate-400
 
 function CustomTooltip({ active, payload, rainStations }: any) {
   if (!active || !payload?.length) return null;
@@ -67,7 +56,7 @@ function CustomTooltip({ active, payload, rainStations }: any) {
   );
 }
 
-function RiverChart({ data, spanHours, showRain, rainStations, envioLimits = [] }: Props) {
+function RiverChart({ data, spanHours, showRain, rainStations }: Props) {
   if (!data.length) {
     return <div className="flex h-full items-center justify-center text-sm text-slate-500">Sem dados no período.</div>;
   }
@@ -81,16 +70,8 @@ function RiverChart({ data, spanHours, showRain, rainStations, envioLimits = [] 
   const visible = (c: number) => c <= dataMax + 1.5 && c >= dataMin - 1.5;
   const cotasVisiveis = [COTAS.atencao, COTAS.alerta, COTAS.inundacao].filter(visible);
 
-  // limites de envio do bot que NÃO coincidem com uma cota oficial do SGB
-  const limitesOficiais = [COTAS.atencao, COTAS.alerta, COTAS.inundacao];
-  const envioVisiveis = (envioLimits || [])
-    .filter((l) => Number.isFinite(l?.meters) && visible(l.meters))
-    .filter((l) => !limitesOficiais.some((c) => Math.abs(c - l.meters) < 0.011))
-    .sort((a, b) => a.meters - b.meters);
-
-  const escala = [...cotasVisiveis, ...envioVisiveis.map((l) => l.meters)];
-  const yMin = Math.max(0, Math.floor((Math.min(dataMin, ...escala) - 0.3) * 10) / 10);
-  const yMax = Math.ceil((Math.max(dataMax, ...escala) + 0.3) * 10) / 10;
+  const yMin = Math.max(0, Math.floor((Math.min(dataMin, ...cotasVisiveis) - 0.3) * 10) / 10);
+  const yMax = Math.ceil((Math.max(dataMax, ...cotasVisiveis) + 0.3) * 10) / 10;
 
   const maxRain = Math.max(0, ...data.map((d) => d.rainAvg || 0));
   const withRain = showRain && maxRain > 0;
@@ -215,24 +196,6 @@ function RiverChart({ data, spanHours, showRain, rainStations, envioLimits = [] 
             }}
           />
         )}
-
-        {/* limites de ENVIO configurados no bot (ex.: 4,50 / 5,20 / 6,00 m) */}
-        {envioVisiveis.map((l) => (
-          <ReferenceLine
-            key={`envio-${l.id}`}
-            yAxisId="level"
-            y={l.meters}
-            stroke={ENVIO_COLOR}
-            strokeOpacity={0.85}
-            strokeDasharray="3 5"
-            label={{
-              value: `${l.name} · envio ${l.meters.toFixed(2)}m`,
-              position: 'insideBottomLeft',
-              fill: ENVIO_COLOR,
-              fontSize: 10,
-            }}
-          />
-        ))}
 
         {/* ---- NÍVEL: na frente das barras ---- */}
         <Area

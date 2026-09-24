@@ -1281,28 +1281,6 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Limiares configurados para envio (público e sem dados sensíveis): é o
-    // que o gráfico do painel desenha como linhas pontilhadas — assim o
-    // gráfico e o bot nunca divergem (requisito: "iguais aos do Telegram").
-    if (req.method === 'GET' && path === '/api/limiares') {
-      send(res, 200, {
-        ok: true,
-        atualizadoEm: Date.now(),
-        limiares: [...store.thresholds]
-          .filter((t) => t.enabled !== false && Number.isFinite(Number(t.meters)))
-          .sort((a, b) => a.meters - b.meters)
-          .map((t) => ({
-            id: t.id,
-            name: t.name,
-            meters: t.meters,
-            preWarningM: Number(t.preWarningM) || 0,
-            preWarningOnlyRise: t.preWarningOnlyRise !== false,
-            enabled: true,
-          })),
-      });
-      return;
-    }
-
     if (req.method === 'POST' && path === '/api/telegram/webhook') {
       // secret_token (Telegram só envia updates para um webhook configurado
       // com o mesmo segredo) — evita que qualquer pessoa que saiba da URL

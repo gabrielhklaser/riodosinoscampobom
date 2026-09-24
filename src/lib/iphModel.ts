@@ -57,6 +57,7 @@
  *    (scripts/test-modelo.mjs — `npm run test:modelo`).
  */
 
+import { COTAS } from './ana';
 import { CALIBRATION_2024, eventRunoffMm } from './rainRunoff';
 import { limitDescent, robustRateCmH } from './recession';
 // Motor de propagação (módulo puro, coberto por scripts/test-modelo.mjs) e
@@ -70,12 +71,18 @@ import { API_SAT_REF, RAIN_PAST_H, cnForSub, propagateCurve } from './iphEngine'
 export type IphClass = 'verde' | 'amarelo' | 'laranja' | 'vermelho';
 
 /**
- * Limiares operacionais do boletim do IPH (m) — mesma escala usada nas
- * linhas pontilhadas do gráfico e nos avisos do Telegram/Defesa Civil.
- * Fonte única: `IPH_CLASS` e o gráfico derivam daqui (antes os números
- * estavam repetidos no código do gráfico e podiam divergir).
+ * Limiares de alerta do boletim (m) — as COTAS OFICIAIS do SGB, as mesmas
+ * usadas pelo bot do Telegram e pelo gráfico principal. Fonte única das
+ * cotas: `COTAS` em ./ana — daqui derivam `IPH_CLASS` e as linhas
+ * pontilhadas do painel, para que painel, boletim e avisos nunca mostrem
+ * escalas diferentes (antes o boletim usava 4,50/5,20/6,00 m e o restante do
+ * painel 6,20/6,70/7,20 m — duas escalas no mesmo produto).
  */
-export const IPH_LIMITES = { atencao: 4.5, alerta: 5.2, inundacao: 6.0 } as const;
+export const IPH_LIMITES = {
+  atencao: COTAS.atencao,
+  alerta: COTAS.alerta,
+  inundacao: COTAS.inundacao,
+} as const;
 
 export const IPH_CLASS: Record<
   IphClass,
