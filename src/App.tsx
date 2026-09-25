@@ -38,6 +38,7 @@ import { FLOOD_META, loadFloodSetSync, type FloodSet } from './lib/flood';
 import AddressRisk, { type AddressPoint } from './components/AddressRisk';
 import FloodAlertModal from './components/FloodAlertModal';
 import InmetAlerts from './components/InmetAlerts';
+import AlertLevelBar from './components/AlertLevelBar';
 import IphForecast from './components/IphForecast';
 import { clearBotToken, loginBot, reportRiverReading, UNAUTHORIZED_EVENT } from './lib/botApi';
 // import UpstreamRisk from './components/UpstreamRisk'; // desativado temporariamente
@@ -441,6 +442,9 @@ export default function App() {
           <>
           {/* ---------- Avisos meteorológicos INMET (topo) ---------- */}
           <InmetAlerts />
+
+          {/* ---------- Barra de níveis de alerta ---------- */}
+          <AlertLevelBar level={error ? null : level} trend={trend} />
 
           {/* ---------- Avisos ---------- */}
           {error && (
