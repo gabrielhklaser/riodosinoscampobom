@@ -25,12 +25,13 @@ export interface BotTrend {
   n: number;
 }
 
-/** Rótulos da tendência (usados no painel). */
+/** Rótulos da tendência (usados no painel). Só texto: sem setas, que
+ *  chegavam corrompidas no Telegram mobile ("→" exibida como "'n"). */
 export const TREND_LABEL: Record<BotTrend['dir'], { texto: string; seta: string }> = {
-  subida: { texto: 'Subida', seta: '↑' },
-  descida: { texto: 'Descida', seta: '↓' },
-  estavel: { texto: 'Estável', seta: '→' },
-  indefinida: { texto: 'Indefinida', seta: '·' },
+  subida: { texto: 'Subida', seta: '' },
+  descida: { texto: 'Descida', seta: '' },
+  estavel: { texto: 'Estável', seta: '' },
+  indefinida: { texto: 'Indefinida', seta: '' },
 };
 
 export interface BotSubscriber {

@@ -243,11 +243,47 @@ async function buscarAvisosInmet() {
   }
 }
 
+/* Tendência só por extenso, SEM setas: no app do Telegram em celulares a seta
+ * "→" chegava corrompida (exibida como "'n"). A linha fica
+ * "Tendência: {tendencia} ({taxa} cm/h)" e o marcador {seta} foi descontinuado. */
+
+/** marcador {seta} e setas literais (→ ↑ ↓ ·), com os espaços ao redor */
+const SETA_RESIDUAL = /[ \t]*(?:(?:\{seta\}|[→↑↓·])[ \t]*)+/g;
+/** linha de tendência: usa algum marcador de tendência ou começa com "Tendência:" */
+const LINHA_TENDENCIA = /\{(?:tendencia|direcao|seta|taxa|variacao)\}|^\s*Tend[êe]ncia\s*:/i;
+
+/** remove {seta} e setas de uma linha sem deixar espaço duplo ou solto */
+function removerSetas(linha) {
+  return linha.replace(SETA_RESIDUAL, (trecho, pos) => {
+    const antes = linha.slice(0, pos);
+    const depois = linha.slice(pos + trecho.length);
+    if (!antes.trim()) return trecho.match(/^[ \t]*/)[0]; // início da linha: mantém o recuo
+    if (!depois.trim() || /^[.,;:!?)\]]/.test(depois) || /\($/.test(antes)) return '';
+    return ' ';
+  });
+}
+
+/**
+ * Migra templates antigos/existentes para "Tendência: {tendencia} ({taxa} cm/h)":
+ *   • remove o marcador {seta} e setas literais (→ ↑ ↓ ·) que tenham sobrado;
+ *   • troca o rótulo antigo "Situação:" por "Tendência:".
+ * Só mexe nas linhas de tendência: o "·" usado como separador em outras
+ * linhas (ex.: "(51) 3597-3683 · 199 · Bombeiros 193") é preservado.
+ * Idempotente — roda a cada carga do store e a cada edição de limite.
+ */
 function migrateTrendLabel(text) {
   if (typeof text !== 'string') return text;
   return text
-    .replaceAll('Situação: {seta} {tendencia} ({taxa} cm/h)', 'Tendência: {seta} {tendencia} ({taxa} cm/h)')
-    .replace(/Situaç[aã]o:\s*(\{seta\}\s*\{tendencia\}\s*\(\{taxa\}\s*cm\/h\))/gi, 'Tendência: $1');
+    .split('\n')
+    .map((linha) =>
+      LINHA_TENDENCIA.test(linha)
+        ? removerSetas(linha).replace(
+            /Situa[çc][aã]o:\s*(\{tendencia\}\s*\(\{taxa\}\s*cm\/h\))/gi,
+            'Tendência: $1',
+          )
+        : linha,
+    )
+    .join('\n');
 }
 
 const DEFAULT_THRESHOLDS = [
@@ -258,7 +294,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
+      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -271,7 +307,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
+      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -284,7 +320,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
+      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -628,11 +664,12 @@ function fmtTaxa(trend) {
   return r > 0 ? `+${formatted}` : `-${formatted}`;
 }
 
+// Sem setas: a tendência vai só por extenso (a "→" corrompia no Telegram mobile).
 const TREND_META = {
-  subida: { seta: '↑', rotulo: 'subida', texto: 'Subida' },
-  descida: { seta: '↓', rotulo: 'descida', texto: 'Descida' },
-  estavel: { seta: '→', rotulo: 'estável', texto: 'Estável' },
-  indefinida: { seta: '·', rotulo: 'indefinida', texto: 'Indefinida' },
+  subida: { seta: '', rotulo: 'subida', texto: 'Subida' },
+  descida: { seta: '', rotulo: 'descida', texto: 'Descida' },
+  estavel: { seta: '', rotulo: 'estável', texto: 'Estável' },
+  indefinida: { seta: '', rotulo: 'indefinida', texto: 'Indefinida' },
 };
 
 /** pré-alimenta store.readings com série histórica recente (ex.: retorno de 48 h da ANA) */
@@ -703,15 +740,18 @@ function interpolate(template, reading, threshold, preM = 0, trend = null) {
     .replaceAll('{vazao}', vazao)
     .replaceAll('{tendencia}', meta.rotulo)
     .replaceAll('{direcao}', meta.rotulo)
-    .replaceAll('{seta}', meta.seta)
+    // {seta} descontinuado (a "→" corrompia no Telegram mobile): some do texto
+    .replaceAll('{seta} ', '')
+    .replaceAll('{seta}', '')
     .replaceAll('{taxa}', taxa)
     .replaceAll('{variacao}', variacao);
 
   // Garantia do requisito: TODO aviso diz se o rio sobe ou desce. Se o texto
   // do operador não usar nenhum marcador de tendência, a linha é acrescentada.
-  const temMarcador = /\{(tendencia|direcao|seta|taxa|variacao)\}/.test(String(template || ''));
+  // ({seta} não conta: não imprime mais nada, então não informa a tendência.)
+  const temMarcador = /\{(tendencia|direcao|taxa|variacao)\}/.test(String(template || ''));
   if (temMarcador) return texto;
-  return `${texto}\n\n${meta.seta} Rio em ${meta.rotulo} (${taxa} cm/h).`;
+  return `${texto}\n\nRio em ${meta.rotulo} (${taxa} cm/h).`;
 }
 
 async function dispatchThreshold(threshold, reading, reason, preM = 0, trend = null) {
@@ -887,7 +927,7 @@ function nivelText() {
   return (
     `Rio dos Sinos — Campo Bom\n` +
     `Nível: ${n} m\n` +
-    `Tendência: ${meta.seta} ${meta.rotulo} (${fmtTaxa(trend)} cm/h)\n` +
+    `Tendência: ${meta.rotulo} (${fmtTaxa(trend)} cm/h)\n` +
     `Situação: ${situacao}\n` +
     `Horário: ${hora}` +
     (r.flow != null ? `\nVazão: ${Number(r.flow).toFixed(1).replace('.', ',')} m³/s` : '')
