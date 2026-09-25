@@ -285,7 +285,7 @@ export default function BotSettings() {
               <Stat
                 icon={icone}
                 label="Tendência do rio"
-                value={`${meta.seta} ${meta.texto}`}
+                value={meta.texto}
                 hint={`${taxa} · ${t?.n ?? 0} leitura(s) nas últimas 3 h`}
                 ok={dir === 'subida' || dir === 'descida' || dir === 'estavel'}
               />
@@ -299,7 +299,7 @@ export default function BotSettings() {
           <strong className="text-rose-300">descida</strong> da curva. Em <strong>subida</strong> o limite mantém o
           aviso normal <em>e</em> o pré-aviso; em <strong>descida</strong> o pré-aviso não é enviado — sai apenas o
           aviso da cota que foi batida. Use os marcadores <code className="text-sky-300">{'{tendencia}'}</code>,{' '}
-          <code className="text-sky-300">{'{seta}'}</code>, <code className="text-sky-300">{'{taxa}'}</code> e{' '}
+          <code className="text-sky-300">{'{taxa}'}</code> e{' '}
           <code className="text-sky-300">{'{variacao}'}</code> na mensagem; se a mensagem não usar nenhum deles, o
           servidor acrescenta a linha de tendência automaticamente.
         </p>
@@ -378,7 +378,7 @@ export default function BotSettings() {
           <h3 className="text-base font-bold text-white">Limites de alerta</h3>
           <p className="mt-0.5 text-xs text-slate-400">
             Edite a cota em metros e o texto enviado pelo bot. Use {'{nivel}'}, {'{cota}'}, {'{hora}'}, {'{nome}'},{' '}
-            {'{pre}'}, {'{tendencia}'} (subida/descida), {'{seta}'} (↑/↓), {'{taxa}'} (cm/h), {'{variacao}'} (m) e{' '}
+            {'{pre}'}, {'{tendencia}'} (subida/descida), {'{taxa}'} (cm/h), {'{variacao}'} (m) e{' '}
             {'{vazao}'} na mensagem. Novos limites entram na comparação automaticamente. O <strong className="text-slate-300">Pré-aviso</strong>{' '}
             avisa antes da cota (ex.: 0,30 m antes). O botão <Send className="inline h-3 w-3" /> envia a mensagem daquele
             limite e o <Bell className="inline h-3 w-3" /> testa o pré-aviso — sempre marcados com “🧪 TESTE”, sem afetar
@@ -767,7 +767,6 @@ export default function BotSettings() {
                         }`}
                         title={`Curva em ${row.direction}${Number.isFinite(row.rateCmH as number) ? ` (${n1(row.rateCmH ?? 0)} cm/h)` : ''}`}
                       >
-                        {TREND_LABEL[(row.direction as keyof typeof TREND_LABEL) ?? 'indefinida']?.seta ?? '·'}{' '}
                         {row.direction}
                       </span>
                     ) : null}
