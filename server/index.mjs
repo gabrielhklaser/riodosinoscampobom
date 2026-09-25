@@ -243,6 +243,13 @@ async function buscarAvisosInmet() {
   }
 }
 
+function migrateTrendLabel(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replaceAll('Situação: {seta} {tendencia} ({taxa} cm/h)', 'Tendência: {seta} {tendencia} ({taxa} cm/h)')
+    .replace(/Situaç[aã]o:\s*(\{seta\}\s*\{tendencia\}\s*\(\{taxa\}\s*cm\/h\))/gi, 'Tendência: $1');
+}
+
 const DEFAULT_THRESHOLDS = [
   {
     id: 'atencao',
@@ -251,7 +258,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
+      '⚠️ ATENÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Atenção.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nEvite áreas ribeirinhas e acompanhe os boletins oficiais.\nDefesa Civil: (51) 3597-3683',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -264,7 +271,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
+      '🟠 ALERTA — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Alerta.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nProcure um local elevado, retire documentos das áreas baixas e afaste-se da margem.\nDefesa Civil: (51) 3597-3683 · 199',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -277,7 +284,7 @@ const DEFAULT_THRESHOLDS = [
     enabled: true,
     builtin: true,
     message:
-      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nSituação: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
+      '🔴 INUNDAÇÃO — Defesa Civil de Campo Bom\n\nO Rio dos Sinos atingiu a cota de Inundação.\nNível atual: {nivel} m (cota: {cota} m).\nTendência: {seta} {tendencia} ({taxa} cm/h).\nHorário: {hora}\n\nDirija-se imediatamente a um abrigo seguro. Não atravesse trechos alagados.\nDefesa Civil: (51) 3597-3683 · 199 · Bombeiros 193',
     preWarningM: 0.3,
     preWarningOnlyRise: true,
     preWarningMessage:
@@ -321,14 +328,17 @@ function loadStore() {
     return {
       ...base,
       ...raw,
-      // garante os campos de pré-alerta (migração de stores antigos)
+      // garante os campos de pré-alerta e migração de labels (stores antigos)
       thresholds: (Array.isArray(raw.thresholds) && raw.thresholds.length ? raw.thresholds : base.thresholds).map((t) => {
         const d = base.thresholds.find((x) => x.id === t.id);
+        const rawMsg = t.message != null ? String(t.message) : d ? d.message : '';
+        const rawPreMsg = t.preWarningMessage != null ? String(t.preWarningMessage) : d ? d.preWarningMessage : '';
         return {
           ...t,
+          message: migrateTrendLabel(rawMsg),
           preWarningM: t.preWarningM != null ? Number(t.preWarningM) || 0 : d ? d.preWarningM : 0,
           preWarningOnlyRise: t.preWarningOnlyRise != null ? !!t.preWarningOnlyRise : true,
-          preWarningMessage: t.preWarningMessage != null ? String(t.preWarningMessage) : d ? d.preWarningMessage : '',
+          preWarningMessage: migrateTrendLabel(rawPreMsg),
         };
       }),
       subscribers: Array.isArray(raw.subscribers) ? raw.subscribers : [],
@@ -589,8 +599,11 @@ function trendOf(serie) {
   const s = (Array.isArray(serie) ? serie : [])
     .filter((r) => Number.isFinite(r?.ts) && Number.isFinite(r?.level))
     .sort((a, b) => a.ts - b.ts);
-  if (s.length < 2) {
-    return { dir: 'indefinida', rateCmH: null, deltaM: null, spanMin: null, n: s.length };
+  if (s.length === 0) {
+    return { dir: 'indefinida', rateCmH: null, deltaM: null, spanMin: null, n: 0 };
+  }
+  if (s.length === 1) {
+    return { dir: 'estavel', rateCmH: 0, deltaM: 0, spanMin: 0, n: s.length };
   }
   const fim = s[s.length - 1].ts;
   const win = s.filter((r) => r.ts >= fim - TREND_WINDOW_MS);
@@ -600,7 +613,19 @@ function trendOf(serie) {
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
   const score = (rate != null ? clamp(rate / 2, -1, 1) * 0.6 : 0) + clamp(deltaM / 0.03, -1, 1) * 0.4;
   const dir = score > 0.2 ? 'subida' : score < -0.2 ? 'descida' : 'estavel';
+  if (dir === 'estavel') {
+    return { dir: 'estavel', rateCmH: 0, deltaM: 0, spanMin: 0, n: s.length };
+  }
   return { dir, rateCmH: rate, deltaM, spanMin, n: win.length };
+}
+
+/** formata taxa como +X,X, -X,X ou 0,0 cm/h (nunca "—", estável sempre 0,0) */
+function fmtTaxa(trend) {
+  if (!trend || trend.dir === 'estavel') return '0,0';
+  const r = trend.rateCmH;
+  if (!Number.isFinite(r) || Math.abs(r) < 0.05) return '0,0';
+  const formatted = Math.abs(r).toFixed(1).replace('.', ',');
+  return r > 0 ? `+${formatted}` : `-${formatted}`;
 }
 
 const TREND_META = {
@@ -609,6 +634,25 @@ const TREND_META = {
   estavel: { seta: '→', rotulo: 'estável', texto: 'Estável' },
   indefinida: { seta: '·', rotulo: 'indefinida', texto: 'Indefinida' },
 };
+
+/** pré-alimenta store.readings com série histórica recente (ex.: retorno de 48 h da ANA) */
+function seedReadings(serie) {
+  const readings = (Array.isArray(serie) ? serie : [])
+    .filter((r) => Number.isFinite(r?.ts) && Number.isFinite(r?.level))
+    .map((r) => ({ ts: r.ts, level: r.level }));
+  if (!readings.length) return;
+  if (!Array.isArray(store.readings) || store.readings.length === 0) {
+    store.readings = readings.slice(-TREND_HISTORY);
+    return;
+  }
+  const known = new Set(store.readings.map((r) => r.ts));
+  const novos = readings.filter((r) => !known.has(r.ts));
+  if (novos.length) {
+    store.readings = [...store.readings, ...novos]
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-TREND_HISTORY);
+  }
+}
 
 /** registra a leitura no histórico curto (dedup por carimbo de hora) */
 function recordReading(reading) {
@@ -644,10 +688,7 @@ function interpolate(template, reading, threshold, preM = 0, trend = null) {
 
   // tendência: subida/descida da curva (o que a Defesa Civil pediu no aviso)
   const meta = TREND_META[trend?.dir] || TREND_META.indefinida;
-  const taxaNum = trend?.rateCmH;
-  const taxa = Number.isFinite(taxaNum)
-    ? `${taxaNum > 0 ? '+' : ''}${Number(taxaNum).toFixed(1).replace('.', ',')}`
-    : '—';
+  const taxa = fmtTaxa(trend);
   const variacao = Number.isFinite(trend?.deltaM)
     ? `${trend.deltaM > 0 ? '+' : ''}${Number(trend.deltaM).toFixed(2).replace('.', ',')}`
     : '—';
@@ -757,7 +798,12 @@ async function evaluateReading(reading) {
   // histórico curto + tendência ANTES de gravar a leitura nova: a comparação
   // é sempre com as leituras anteriores (requisito: "faça a leitura anterior
   // para saber se aquele disparo provém de uma subida ou de uma descida").
-  const trend = trendOf(store.readings);
+  // Se store.readings estiver vazio, usa a leitura atual como fallback para que
+  // uma leitura válida nunca gere 'indefinida'.
+  const readingsForTrend = Array.isArray(store.readings) && store.readings.length > 0
+    ? store.readings
+    : [{ ts, level: reading.level }];
+  const trend = trendOf(readingsForTrend);
   recordReading({ ts, level: reading.level });
 
   const enabled = [...store.thresholds]
@@ -833,11 +879,15 @@ function nivelText() {
     .filter((t) => t.enabled !== false && r.level >= t.meters)
     .sort((a, b) => b.meters - a.meters)[0];
   const situacao = active ? active.name : 'Normal';
-  const meta = TREND_META[trendOf(store.readings).dir] || TREND_META.indefinida;
+  const readingsForTrend = Array.isArray(store.readings) && store.readings.length > 0
+    ? store.readings
+    : [{ ts: r.ts, level: r.level }];
+  const trend = trendOf(readingsForTrend);
+  const meta = TREND_META[trend.dir] || TREND_META.indefinida;
   return (
     `Rio dos Sinos — Campo Bom\n` +
     `Nível: ${n} m\n` +
-    `Tendência: ${meta.seta} ${meta.rotulo}\n` +
+    `Tendência: ${meta.seta} ${meta.rotulo} (${fmtTaxa(trend)} cm/h)\n` +
     `Situação: ${situacao}\n` +
     `Horário: ${hora}` +
     (r.flow != null ? `\nVazão: ${Number(r.flow).toFixed(1).replace('.', ',')} m³/s` : '')
@@ -1167,13 +1217,15 @@ async function fetchAnaLatest() {
   const xml = await res.text();
   const readings = parseAnaXml(xml);
   if (!readings.length) throw new Error('ANA sem registros');
-  return readings[readings.length - 1];
+  return readings;
 }
 
 async function pollAna() {
   while (true) {
     try {
-      const last = await fetchAnaLatest();
+      const readings = await fetchAnaLatest();
+      const last = readings[readings.length - 1];
+      seedReadings(readings.slice(0, -1));
       await evaluateReading({ ...last, source: 'ana' });
     } catch (err) {
       console.error('[ana]', err instanceof Error ? err.message : err);
@@ -1221,7 +1273,13 @@ function publicConfig() {
     })),
     lastReading: store.lastReading,
     /** tendência atual da curva (subida/descida) — exibida no painel */
-    trend: trendOf(store.readings),
+    trend: trendOf(
+      Array.isArray(store.readings) && store.readings.length > 0
+        ? store.readings
+        : store.lastReading
+        ? [{ ts: store.lastReading.ts, level: store.lastReading.level }]
+        : []
+    ),
     fired: store.fired,
     log: store.log.slice(0, 40),
     // Nunca expor o token por padrão: quem tem o token controla o bot.
@@ -1246,15 +1304,16 @@ async function readBody(req) {
 function normalizeThreshold(input, fallback = {}) {
   const name = String(input.name ?? fallback.name ?? '').trim();
   const meters = Number(String(input.meters ?? fallback.meters ?? '').toString().replace(',', '.'));
-  const message = String(input.message ?? fallback.message ?? '').trim();
+  const message = migrateTrendLabel(String(input.message ?? fallback.message ?? '').trim());
   const enabled = input.enabled == null ? fallback.enabled !== false : !!input.enabled;
   // pré-alerta: distância (m) ANTES da cota; 0 = desativado
   const rawPre = input.preWarningM === '' || input.preWarningM == null ? fallback.preWarningM : input.preWarningM;
   const preWarningM = Number(String(rawPre ?? 0).replace(',', '.'));
-  const preWarningMessage =
+  const preWarningMessage = migrateTrendLabel(
     input.preWarningMessage == null
       ? String(fallback.preWarningMessage ?? '')
-      : String(input.preWarningMessage).trim();
+      : String(input.preWarningMessage).trim()
+  );
   // pré-aviso só na subida (default LIGADO — requisito da Defesa Civil)
   const preWarningOnlyRise =
     input.preWarningOnlyRise == null ? fallback.preWarningOnlyRise !== false : !!input.preWarningOnlyRise;
@@ -1599,7 +1658,11 @@ const server = createServer(async (req, res) => {
       const reading = store.lastReading || { level: t.meters, ts: Date.now(), flow: null };
       // o teste usa a tendência REAL do momento, para o operador ver na
       // prática como a mensagem sai com {tendencia}/{taxa} preenchidos
-      const trendAtual = trendOf(store.readings);
+      const readingsForTrend =
+        Array.isArray(store.readings) && store.readings.length > 0
+          ? store.readings
+          : [{ ts: reading.ts, level: reading.level }];
+      const trendAtual = trendOf(readingsForTrend);
       const entry = preTest
         ? await dispatchThreshold({ ...t, message: t.preWarningMessage }, reading, 'teste_manual', preM, trendAtual)
         : await dispatchThreshold(t, reading, 'teste_manual', 0, trendAtual);
